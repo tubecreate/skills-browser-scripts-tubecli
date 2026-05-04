@@ -1,0 +1,381 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Script Studio — Browser Automation</title>
+    <meta name="description" content="Visual browser automation script editor for TubeCLI">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/icon?family=Material+Symbols+Outlined" rel="stylesheet">
+    <link rel="stylesheet" href="/script-studio/styles.css">
+</head>
+<body>
+    <div id="app">
+        <!-- Top Bar -->
+        <header id="topbar">
+            <div class="topbar-left">
+                <span class="logo">🤖</span>
+                <h1>Script Studio</h1>
+            </div>
+            <div class="topbar-center">
+                <span id="currentScriptName" class="script-badge">No Script Selected</span>
+            </div>
+            <div class="topbar-right">
+                <button id="btnAIGenerate" class="btn btn-accent" title="AI Generate Script">
+                    <span class="material-symbols-outlined">auto_awesome</span> AI Generate
+                </button>
+                <button id="btnImportScript" class="btn btn-ghost" title="Import JSON">
+                    <span class="material-symbols-outlined">upload_file</span>
+                </button>
+                <button id="btnNewScript" class="btn btn-primary">
+                    <span class="material-symbols-outlined">add</span> New Script
+                </button>
+            </div>
+        </header>
+
+        <!-- Main Layout -->
+        <div id="main-layout">
+            <!-- Sidebar: Script List -->
+            <aside id="sidebar">
+                <div class="sidebar-header">
+                    <input type="text" id="searchScripts" placeholder="Search scripts..." class="search-input">
+                </div>
+                <div id="scriptCategories" class="category-list">
+                    <div class="category-item active" data-category="">All Scripts</div>
+                    <div class="category-item" data-category="video">🎬 Video</div>
+                    <div class="category-item" data-category="image">🖼️ Image</div>
+                    <div class="category-item" data-category="audio">🎵 Audio</div>
+                    <div class="category-item" data-category="scraping">🕷️ Scraping</div>
+                    <div class="category-item" data-category="general">📄 General</div>
+                </div>
+                <div id="scriptList" class="script-list">
+                    <div class="empty-state">
+                        <span class="material-symbols-outlined">code_off</span>
+                        <p>No scripts yet</p>
+                    </div>
+                </div>
+            </aside>
+
+            <!-- Resize handle -->
+            <div class="resize-handle" id="sidebarResize"></div>
+
+            <!-- Center: Step Editor -->
+            <section id="editor-panel">
+                <div class="editor-toolbar">
+                    <div class="editor-tabs">
+                        <button class="tab active" data-tab="steps">Steps</button>
+                        <button class="tab" data-tab="variables">Variables</button>
+                        <button class="tab" data-tab="settings">Settings</button>
+                        <button class="tab" data-tab="history">History</button>
+                    </div>
+                    <div class="editor-actions">
+                        <button id="btnAddStep" class="btn btn-sm btn-ghost" title="Add Step">
+                            <span class="material-symbols-outlined">add_circle</span>
+                        </button>
+                    </div>
+                </div>
+
+                <!-- Steps Tab -->
+                <div id="tabSteps" class="tab-content active">
+                    <div id="stepsList" class="steps-list">
+                        <div class="empty-state">
+                            <span class="material-symbols-outlined">list_alt</span>
+                            <p>Add steps to start building your script</p>
+                            <button class="btn btn-primary btn-sm" onclick="addStep()">
+                                <span class="material-symbols-outlined">add</span> Add First Step
+                            </button>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Variables Tab -->
+                <div id="tabVariables" class="tab-content">
+                    <div class="variables-panel">
+                        <div class="panel-header">
+                            <h3>Script Variables</h3>
+                            <button class="btn btn-sm btn-ghost" onclick="addVariable()">
+                                <span class="material-symbols-outlined">add</span>
+                            </button>
+                        </div>
+                        <div id="variablesList" class="variables-list"></div>
+                    </div>
+                </div>
+
+                <!-- Settings Tab -->
+                <div id="tabSettings" class="tab-content">
+                    <div class="settings-panel">
+                        <div class="form-group">
+                            <label>Script Name</label>
+                            <input type="text" id="settingName" class="form-input" placeholder="Script name">
+                        </div>
+                        <div class="form-group">
+                            <label>Slug (API ID)</label>
+                            <input type="text" id="settingSlug" class="form-input" placeholder="veo3_generate_video">
+                        </div>
+                        <div class="form-group">
+                            <label>Description</label>
+                            <textarea id="settingDesc" class="form-input" rows="3" placeholder="Describe what this script does..."></textarea>
+                        </div>
+                        <div class="form-group">
+                            <label>Category</label>
+                            <select id="settingCategory" class="form-input">
+                                <option value="video">🎬 Video</option>
+                                <option value="image">🖼️ Image</option>
+                                <option value="audio">🎵 Audio</option>
+                                <option value="scraping">🕷️ Scraping</option>
+                                <option value="general">📄 General</option>
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <label>Target URL</label>
+                            <input type="text" id="settingUrl" class="form-input" placeholder="https://...">
+                        </div>
+                        <button class="btn btn-primary" onclick="saveSettings()">
+                            <span class="material-symbols-outlined">save</span> Save Settings
+                        </button>
+                    </div>
+                </div>
+
+                <!-- History Tab -->
+                <div id="tabHistory" class="tab-content">
+                    <div id="executionHistory" class="history-list">
+                        <div class="empty-state">
+                            <span class="material-symbols-outlined">history</span>
+                            <p>No execution history</p>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Bottom Execution Bar -->
+                <div id="execBar">
+                    <div class="exec-left">
+                        <select id="execProfile" class="form-input form-input-sm">
+                            <option value="">Select Profile...</option>
+                        </select>
+                        <select id="execEngine" class="form-input form-input-sm" title="Browser engine">
+                            <option value="playwright">⚡ Playwright</option>
+                            <option value="bablosoft">🛡️ Bablosoft</option>
+                        </select>
+                        <label class="exec-toggle" title="Show Browser: mở cửa sổ riêng">
+                            <input type="checkbox" id="showBrowserToggle">
+                            <span class="material-symbols-outlined" style="font-size:16px">desktop_windows</span>
+                            <span style="font-size:12px">Show</span>
+                        </label>
+                    </div>
+                    <div class="exec-right">
+                        <button id="btnRun" class="btn btn-success" onclick="runScript()">
+                            <span class="material-symbols-outlined">play_arrow</span> Run
+                        </button>
+                        <button id="btnPause" class="btn btn-warning" onclick="togglePauseScript()" disabled>
+                            <span class="material-symbols-outlined">pause</span> Pause
+                        </button>
+                        <button id="btnStop" class="btn btn-danger" onclick="stopScript()" disabled>
+                            <span class="material-symbols-outlined">stop</span> Stop
+                        </button>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Resize handle -->
+            <div class="resize-handle" id="editorResize"></div>
+
+            <!-- Right: Browser Preview -->
+            <section id="preview-panel">
+                <div class="preview-toolbar">
+                    <div class="preview-url-bar">
+                        <button class="btn btn-sm btn-ghost nav-btn" onclick="navAction('back')" title="Back">
+                            <span class="material-symbols-outlined" style="font-size:18px">arrow_back</span>
+                        </button>
+                        <button class="btn btn-sm btn-ghost nav-btn" onclick="navAction('forward')" title="Forward">
+                            <span class="material-symbols-outlined" style="font-size:18px">arrow_forward</span>
+                        </button>
+                        <button class="btn btn-sm btn-ghost nav-btn" id="btnReload" onclick="navAction('reload')" title="Reload">
+                            <span class="material-symbols-outlined" style="font-size:18px">refresh</span>
+                        </button>
+                        <input type="text" id="previewUrl" class="form-input form-input-sm" placeholder="Enter URL..." value="about:blank" onkeydown="if(event.key==='Enter')navigatePreview()">
+                        <button class="btn btn-sm btn-ghost" onclick="navigatePreview()" title="Go">
+                            <span class="material-symbols-outlined">arrow_forward</span>
+                        </button>
+                    </div>
+                    <div class="preview-actions">
+                        <button id="btnLaunchPreview" class="btn btn-sm btn-accent" onclick="launchPreview()">
+                            <span class="material-symbols-outlined">open_in_browser</span> Launch
+                        </button>
+                        <button id="btnPicker" class="btn btn-sm btn-ghost" onclick="togglePicker()" title="Element Picker">
+                            <span class="material-symbols-outlined">my_location</span>
+                        </button>
+                        <button class="btn btn-sm btn-ghost" onclick="takeScreenshot()" title="Screenshot">
+                            <span class="material-symbols-outlined">screenshot_monitor</span>
+                        </button>
+                    </div>
+                </div>
+                <div id="previewContainer" class="preview-container">
+                    <div class="empty-state">
+                        <span class="material-symbols-outlined">web</span>
+                        <p>Click "Launch" to open browser preview</p>
+                        <p class="text-sm">Or run a script to see it in action</p>
+                    </div>
+                </div>
+                <!-- Execution Log -->
+                <div id="logPanel" class="log-panel">
+                    <div class="log-header">
+                        <span>Console</span>
+                        <button class="btn btn-sm btn-ghost" onclick="clearLog()">
+                            <span class="material-symbols-outlined">delete_sweep</span>
+                        </button>
+                    </div>
+                    <div id="logContent" class="log-content"></div>
+                </div>
+            </section>
+        </div>
+    </div>
+
+    <!-- Chat Bot Toggle -->
+    <button id="chatToggle" class="chat-toggle-btn" onclick="toggleChat()" title="AI Assistant">
+        <span class="material-symbols-outlined">smart_toy</span>
+    </button>
+
+    <!-- Chat Panel (Floating Drawer) -->
+    <div id="chatPanel" class="chat-panel" style="display:none">
+        <div class="chat-header">
+            <span class="material-symbols-outlined" style="color:var(--accent)">smart_toy</span>
+            <span>Script Assistant</span>
+            <div style="flex:1"></div>
+            <button class="btn btn-sm btn-ghost" onclick="clearChat()" title="Clear chat">
+                <span class="material-symbols-outlined">delete_sweep</span>
+            </button>
+            <button class="btn btn-sm btn-ghost" onclick="toggleChat()">
+                <span class="material-symbols-outlined">close</span>
+            </button>
+        </div>
+        <div id="chatMessages" class="chat-messages">
+            <div class="chat-msg bot">
+                <div class="chat-bubble">Xin chào! Tôi có thể giúp bạn chỉnh sửa script, tạo nội dung động, hoặc sửa lỗi. Hãy hỏi tôi!</div>
+            </div>
+        </div>
+        <div class="chat-input-bar">
+            <input type="text" id="chatInput" class="form-input" placeholder="Hỏi AI về script..." onkeydown="if(event.key==='Enter')sendChat()">
+            <button class="btn btn-accent btn-sm" onclick="sendChat()">
+                <span class="material-symbols-outlined">send</span>
+            </button>
+        </div>
+    </div>
+    <!-- Step Type Selector Modal -->
+    <div id="stepTypeModal" class="modal" style="display:none">
+        <div class="modal-backdrop" onclick="closeStepTypeModal()"></div>
+        <div class="modal-content">
+            <h3>Add Step</h3>
+            <div class="step-type-grid">
+                <button class="step-type-btn" onclick="insertStep('navigate')">
+                    <span class="material-symbols-outlined">language</span>Navigate
+                </button>
+                <button class="step-type-btn" onclick="insertStep('click')">
+                    <span class="material-symbols-outlined">ads_click</span>Click
+                </button>
+                <button class="step-type-btn" onclick="insertStep('type')">
+                    <span class="material-symbols-outlined">keyboard</span>Type
+                </button>
+                <button class="step-type-btn" onclick="insertStep('wait')">
+                    <span class="material-symbols-outlined">hourglass_empty</span>Wait
+                </button>
+                <button class="step-type-btn" onclick="insertStep('sleep')">
+                    <span class="material-symbols-outlined">timer</span>Sleep
+                </button>
+                <button class="step-type-btn" onclick="insertStep('ai_generate')">
+                    <span class="material-symbols-outlined">auto_awesome</span>AI Text
+                </button>
+                <button class="step-type-btn" onclick="insertStep('evaluate')">
+                    <span class="material-symbols-outlined">code</span>Evaluate
+                </button>
+                <button class="step-type-btn" onclick="insertStep('extract')">
+                    <span class="material-symbols-outlined">content_copy</span>Extract
+                </button>
+                <button class="step-type-btn" onclick="insertStep('screenshot')">
+                    <span class="material-symbols-outlined">screenshot_monitor</span>Screenshot
+                </button>
+                <button class="step-type-btn" onclick="insertStep('download')">
+                    <span class="material-symbols-outlined">download</span>Download
+                </button>
+                <button class="step-type-btn" onclick="insertStep('condition')">
+                    <span class="material-symbols-outlined">call_split</span>Condition
+                </button>
+                <button class="step-type-btn" onclick="insertStep('loop')">
+                    <span class="material-symbols-outlined">loop</span>Loop
+                </button>
+                <button class="step-type-btn" onclick="insertStep('keyboard')">
+                    <span class="material-symbols-outlined">keyboard_return</span>Key Press
+                </button>
+                <button class="step-type-btn" onclick="insertStep('scroll')">
+                    <span class="material-symbols-outlined">swap_vert</span>Scroll
+                </button>
+                <button class="step-type-btn" onclick="insertStep('mouse_move')">
+                    <span class="material-symbols-outlined">mouse</span>Mouse Move
+                </button>
+                <button class="step-type-btn" onclick="insertStep('hover')">
+                    <span class="material-symbols-outlined">near_me</span>Hover
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <!-- New Script Modal -->
+    <div id="newScriptModal" class="modal" style="display:none">
+        <div class="modal-backdrop" onclick="closeNewScriptModal()"></div>
+        <div class="modal-content">
+            <h3>Create New Script</h3>
+            <div class="form-group">
+                <label>Name</label>
+                <input type="text" id="newScriptName" class="form-input" placeholder="My Automation Script">
+            </div>
+            <div class="form-group">
+                <label>Category</label>
+                <select id="newScriptCategory" class="form-input">
+                    <option value="general">📄 General</option>
+                    <option value="video">🎬 Video</option>
+                    <option value="image">🖼️ Image</option>
+                    <option value="audio">🎵 Audio</option>
+                    <option value="scraping">🕷️ Scraping</option>
+                </select>
+            </div>
+            <div class="form-group">
+                <label>Target URL</label>
+                <input type="text" id="newScriptUrl" class="form-input" placeholder="https://...">
+            </div>
+            <div class="modal-actions">
+                <button class="btn btn-ghost" onclick="closeNewScriptModal()">Cancel</button>
+                <button class="btn btn-primary" onclick="createNewScript()">Create</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- AI Generate Modal -->
+    <div id="aiGenerateModal" class="modal" style="display:none">
+        <div class="modal-backdrop" onclick="closeModal('aiGenerateModal')"></div>
+        <div class="modal-content" style="max-width:560px">
+            <h3><span class="material-symbols-outlined" style="vertical-align:middle;color:var(--accent)">auto_awesome</span> AI Generate Script</h3>
+            <p style="color:var(--text-muted);font-size:0.85rem;margin-bottom:12px">Mô tả hành động bạn muốn tự động hóa, AI sẽ tạo script cho bạn.</p>
+            <div class="form-group">
+                <label>Mô tả tự động hóa</label>
+                <textarea id="aiPrompt" class="form-input" rows="4" placeholder="Ví dụ: Mở Veo3 trên Google AI Studio, nhập prompt video, bấm Generate, đợi render xong rồi download video"></textarea>
+            </div>
+            <div class="form-group">
+                <label>URL mục tiêu (tùy chọn)</label>
+                <input type="text" id="aiTargetUrl" class="form-input" placeholder="https://aistudio.google.com/...">
+            </div>
+            <div id="aiGenerateStatus" style="display:none;padding:8px 12px;border-radius:8px;background:var(--surface-2);margin-bottom:12px;font-size:0.85rem">
+                <span class="material-symbols-outlined" style="animation:spin 1s linear infinite;vertical-align:middle">progress_activity</span>
+                <span id="aiGenerateStatusText">Đang tạo script bằng AI...</span>
+            </div>
+            <div class="modal-actions">
+                <button class="btn btn-ghost" onclick="closeModal('aiGenerateModal')">Cancel</button>
+                <button id="btnDoAIGenerate" class="btn btn-accent" onclick="doAIGenerate()">
+                    <span class="material-symbols-outlined">auto_awesome</span> Generate
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <script src="/script-studio/app.js"></script>
+</body>
+</html>

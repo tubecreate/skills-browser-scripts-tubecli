@@ -1,0 +1,821 @@
+"""
+Script Studio — API Routes.
+"""
+from fastapi import APIRouter, HTTPException, Request
+from fastapi.responses import FileResponse
+from pydantic import BaseModel
+from typing import Optional, List, Any
+import os
+import json
+import logging
+import subprocess
+import threading
+import time
+
+logger = logging.getLogger("ScriptStudio.Routes")
+router = APIRouter(prefix="/api/v1/scripts", tags=["scripts"])
+
+# ── Static UI Router ──
+ui_router = APIRouter(tags=["script-studio-ui"])
+_EXT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+@ui_router.get("/script-studio")
+async def serve_ui():
+    return FileResponse(os.path.join(_EXT_DIR, "static", "index.html"), media_type="text/html")
+
+@ui_router.get("/script-studio/{filename:path}")
+async def serve_static(filename: str):
+    filepath = os.path.join(_EXT_DIR, "static", filename)
+    if os.path.isfile(filepath):
+        media = "text/css" if filename.endswith(".css") else "application/javascript" if filename.endswith(".js") else "application/octet-stream"
+        return FileResponse(filepath, media_type=media)
+    raise HTTPException(404, "File not found")
+
+_db_mod = None
+
+def _db():
+    global _db_mod
+    if _db_mod is None:
+        import importlib.util
+        ext_dir = os.path.dirname(os.path.abspath(__file__))
+        db_file = os.path.join(ext_dir, "db", "database.py")
+        spec = importlib.util.spec_from_file_location("script_studio_db", db_file)
+        _db_mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(_db_mod)
+    
+    db = _db_mod.ScriptDatabase.get_instance()
+    if db is None:
+        # Init DB if not yet initialized
+        from tubecli.config import DATA_DIR
+        db_dir = os.path.join(str(DATA_DIR), "browser_scripts")
+        os.makedirs(db_dir, exist_ok=True)
+        db_path = os.path.join(db_dir, "scripts.db")
+        db = _db_mod.ScriptDatabase.get_instance(db_path)
+    return db
+
+
+def _get_node_env():
+    """Get environment with NODE_PATH pointing to browser extension's node_modules."""
+    env = os.environ.copy()
+    # Playwright is installed in the browser extension's node_modules
+    browser_ext_nm = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "..", "..", "..", "tubecli", "extensions", "browser", "node_modules"
+    )
+    browser_ext_nm = os.path.normpath(browser_ext_nm)
+    if os.path.isdir(browser_ext_nm):
+        existing = env.get("NODE_PATH", "")
+        env["NODE_PATH"] = browser_ext_nm + (";" + existing if existing else "")
+    return env
+
+
+def _get_profiles_dir():
+    """Get browser profiles directory from TubeCLI config."""
+    try:
+        from tubecli.config import DATA_DIR
+        return os.path.join(str(DATA_DIR), "browser_profiles")
+    except Exception:
+        return ""
+
+
+# ── Models ──
+
+class ScriptCreate(BaseModel):
+    name: str
+    slug: Optional[str] = None
+    description: str = ""
+    category: str = "general"
+    target_url: str = ""
+    tags: List[str] = []
+    steps: List[dict] = []
+    variables: List[dict] = []
+    is_template: bool = False
+
+class ScriptUpdate(BaseModel):
+    name: Optional[str] = None
+    slug: Optional[str] = None
+    description: Optional[str] = None
+    category: Optional[str] = None
+    target_url: Optional[str] = None
+    tags: Optional[List[str]] = None
+    steps: Optional[List[dict]] = None
+    variables: Optional[List[dict]] = None
+    is_template: Optional[bool] = None
+
+class RunRequest(BaseModel):
+    profile: str = ""
+    variables: dict = {}
+    headless: bool = True
+    engine: str = "playwright"  # "playwright" or "bablosoft"
+
+
+# ── Script CRUD ──
+
+@router.get("")
+async def list_scripts(category: Optional[str] = None):
+    scripts = _db().list_scripts(category)
+    return {"scripts": scripts}
+
+@router.post("")
+async def create_script(req: ScriptCreate):
+    try:
+        script = _db().create_script(
+            name=req.name, slug=req.slug, description=req.description,
+            category=req.category, target_url=req.target_url,
+            tags=req.tags, steps=req.steps, variables=req.variables,
+            is_template=req.is_template,
+        )
+        return {"status": "created", "script": script}
+    except Exception as e:
+        raise HTTPException(400, str(e))
+
+@router.get("/{script_id}")
+async def get_script(script_id: int):
+    script = _db().get_script(script_id)
+    if not script:
+        raise HTTPException(404, "Script not found")
+    return script
+
+@router.put("/{script_id}")
+async def update_script(script_id: int, req: ScriptUpdate):
+    data = req.model_dump(exclude_none=True)
+    if not data:
+        raise HTTPException(400, "No fields to update")
+    script = _db().update_script(script_id, **data)
+    if not script:
+        raise HTTPException(404, "Script not found")
+    return {"status": "updated", "script": script}
+
+@router.delete("/{script_id}")
+async def delete_script(script_id: int):
+    _db().delete_script(script_id)
+    return {"status": "deleted"}
+
+@router.post("/{script_id}/duplicate")
+async def duplicate_script(script_id: int):
+    script = _db().duplicate_script(script_id)
+    if not script:
+        raise HTTPException(404, "Script not found")
+    return {"status": "duplicated", "script": script}
+
+
+# ── Steps ──
+
+@router.put("/{script_id}/steps")
+async def update_steps(script_id: int, request: Request):
+    body = await request.json()
+    steps = body.get("steps", [])
+    script = _db().update_script(script_id, steps=steps)
+    if not script:
+        raise HTTPException(404, "Script not found")
+    return {"status": "updated", "steps": script.get("steps", [])}
+
+
+# ── Execution ──
+
+_running_processes = {}
+_running_logs = {}  # exec_id -> list of log lines (real-time)
+
+@router.post("/{script_id}/run")
+async def run_script(script_id: int, req: RunRequest):
+    script = _db().get_script(script_id)
+    if not script:
+        raise HTTPException(404, "Script not found")
+
+    exec_id = _db().create_execution(script_id, req.profile, req.variables)
+
+    ext_dir = os.path.dirname(os.path.abspath(__file__))
+    runner_path = os.path.join(ext_dir, "runner", "script_runner.js")
+
+    # Write temp script file for runner
+    tmp_dir = os.path.join(ext_dir, "runner", "tmp")
+    os.makedirs(tmp_dir, exist_ok=True)
+    tmp_file = os.path.join(tmp_dir, f"exec_{exec_id}.json")
+    with open(tmp_file, "w", encoding="utf-8") as f:
+        json.dump({
+            "script": script,
+            "variables": req.variables,
+            "profile": req.profile,
+            "headless": req.headless,
+            "engine": req.engine,
+            "exec_id": exec_id,
+            "profiles_dir": _get_profiles_dir(),
+        }, f, ensure_ascii=False, indent=2)
+
+    _running_logs[exec_id] = []
+
+    def run_bg():
+        try:
+            env = _get_node_env()
+            proc = subprocess.Popen(
+                ["node", runner_path, "--exec-file", tmp_file],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                cwd=ext_dir, encoding="utf-8", errors="replace",
+                env=env,
+            )
+            _running_processes[exec_id] = proc
+            for line in proc.stdout:
+                stripped = line.rstrip()
+                if exec_id in _running_logs:
+                    _running_logs[exec_id].append(stripped)
+            proc.wait()
+            final_log = "\n".join(_running_logs.get(exec_id, [])[-500:])
+            _db().update_execution(exec_id,
+                status="success" if proc.returncode == 0 else "error",
+                log=final_log,
+                finished_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            )
+        except Exception as e:
+            if exec_id in _running_logs:
+                _running_logs[exec_id].append(f"ERROR: {e}")
+            _db().update_execution(exec_id, status="error", log=str(e),
+                finished_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
+        finally:
+            _running_processes.pop(exec_id, None)
+            # Keep logs for 60s after finish, then cleanup
+            def cleanup():
+                time.sleep(60)
+                _running_logs.pop(exec_id, None)
+            threading.Thread(target=cleanup, daemon=True).start()
+            try:
+                os.remove(tmp_file)
+            except OSError:
+                pass
+
+    threading.Thread(target=run_bg, daemon=True).start()
+    return {"status": "started", "exec_id": exec_id}
+
+@router.get("/execution/{exec_id}/logs")
+async def get_execution_logs(exec_id: int, offset: int = 0):
+    """Get real-time logs for a running execution."""
+    logs = _running_logs.get(exec_id, [])
+    new_lines = logs[offset:]
+    is_running = exec_id in _running_processes
+    return {
+        "lines": new_lines,
+        "offset": len(logs),
+        "running": is_running,
+    }
+
+@router.get("/{script_id}/status")
+async def get_execution_status(script_id: int):
+    execs = _db().list_executions(script_id, limit=1)
+    if not execs:
+        return {"status": "no_executions"}
+    return execs[0]
+
+@router.post("/execution/{exec_id}/stop")
+async def stop_execution(exec_id: int):
+    proc = _running_processes.get(exec_id)
+    if proc:
+        try:
+            # Kill process tree (node + chrome) on Windows
+            import platform
+            if platform.system() == "Windows":
+                subprocess.run(
+                    ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                    capture_output=True, timeout=5
+                )
+            else:
+                proc.terminate()
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        _running_processes.pop(exec_id, None)
+        _db().update_execution(exec_id, status="cancelled",
+            finished_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
+        return {"status": "stopped"}
+    return {"status": "not_running"}
+
+@router.get("/executions/history")
+async def execution_history(limit: int = 50):
+    return {"executions": _db().list_executions(limit=limit)}
+
+
+# ── Browser Preview ──
+
+_preview_processes = {}
+
+@router.post("/preview/launch")
+async def launch_preview(request: Request):
+    """Launch a browser for preview/element picking."""
+    body = await request.json()
+    profile = body.get("profile", "")
+    url = body.get("url", "about:blank")
+
+    ext_dir = os.path.dirname(os.path.abspath(__file__))
+    preview_path = os.path.join(ext_dir, "runner", "preview_server.js")
+
+    # Find available port
+    import socket
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.bind(("", 0))
+    port = sock.getsockname()[1]
+    sock.close()
+
+    env = _get_node_env()
+    profiles_dir = _get_profiles_dir()
+    proc = subprocess.Popen(
+        ["node", preview_path, "--profile", profile or "default",
+         "--url", url, "--port", str(port),
+         "--profiles-dir", profiles_dir],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        cwd=ext_dir, encoding="utf-8", errors="replace",
+        env=env,
+    )
+    session_id = f"preview_{int(time.time())}"
+    _preview_processes[session_id] = {"proc": proc, "port": port, "profile": profile}
+    return {"status": "launched", "session_id": session_id, "port": port}
+
+@router.post("/preview/stop")
+async def stop_preview(request: Request):
+    body = await request.json()
+    session_id = body.get("session_id", "")
+    info = _preview_processes.pop(session_id, None)
+    if info:
+        try:
+            info["proc"].terminate()
+        except Exception:
+            pass
+        return {"status": "stopped"}
+    return {"status": "not_found"}
+
+
+# ── AI Generate Script ──
+
+@router.post("/generate")
+async def ai_generate_script(request: Request):
+    """Generate automation steps from a natural language description using AI."""
+    body = await request.json()
+    prompt_text = body.get("prompt", "")
+    script_name = body.get("name", "AI Generated Script")
+    target_url = body.get("target_url", "")
+
+    if not prompt_text:
+        raise HTTPException(400, "Missing 'prompt' field")
+
+    system_prompt = f"""You are an expert browser automation script generator for Script Studio.
+Generate a JSON object with automation steps based on the user's description.
+The script MUST behave like a real human user — not a robot.
+
+Available step types:
+- navigate: Go to URL. params: {{ url: string }}
+- click: Click element. selector: CSS selector
+- type: Type text. selector: CSS selector, params: {{ text: string, clear_first: bool }}
+- wait: Wait for element. selector: CSS selector, params: {{ state: "visible"|"hidden", timeout: number }}
+- sleep: Random delay. params: {{ ms: number }} (use 1000-3000 for natural pauses)
+- scroll: Scroll page. params: {{ direction: "down"|"up", amount: 200-600 }}
+- mouse_move: Move mouse to random area. params: {{ x: number, y: number }} (omit for random position)
+- hover: Hover over element. selector: CSS selector
+- evaluate: Run JS code. params: {{ code: string, save_as: string }}
+- extract: Extract data. selector: CSS selector, params: {{ attribute: "innerText"|"innerHTML"|"href"|"src"|"value", save_as: string }}
+- screenshot: Take screenshot. params: {{ save_as: string, full_page: bool }}
+- keyboard: Press key. params: {{ key: "Enter"|"Tab"|"Escape"|etc }}
+- condition: If/else. params: {{ check: "JS expression", then_steps: [...], else_steps: [...] }}
+- loop: Repeat steps. params: {{ count: number, delay: number, steps: [...], break_on: "JS expression" }}
+- download: Download file. selector: trigger element, params: {{ output_dir: string, filename: string }}
+
+CRITICAL RULES FOR HUMAN-LIKE BEHAVIOR:
+1. Add a "sleep" step (1000-3000ms) between major actions (after navigate, after click, before type)
+2. Add "scroll" steps before interacting with elements below the fold (comment sections, footers)
+3. Add "hover" steps before clicking important elements (buttons, links, videos)
+4. Add "mouse_move" steps occasionally between actions for idle mouse movement
+5. After loading a page, add a "sleep" (2000-4000ms) to simulate reading
+6. Use "scroll" with direction "down" and amount 300-500 to reveal lower content naturally
+7. Between typing and pressing Enter, add a short "sleep" (500-1500ms)
+
+Variables can be referenced with {{{{var_name}}}} in any string field.
+
+Output format (JSON only, no markdown):
+{{
+  "name": "{script_name}",
+  "description": "...",
+  "category": "video|image|audio|scraping|general",
+  "target_url": "{target_url}",
+  "steps": [
+    {{ "type": "navigate", "label": "Go to site", "selector": "", "params": {{ "url": "https://..." }}, "enabled": true, "on_error": "abort", "retry_count": 0 }},
+    ...
+  ],
+  "variables": [
+    {{ "name": "var_name", "default": "value", "description": "..." }},
+    ...
+  ]
+}}
+
+User request: {prompt_text}
+{f'Target URL: {target_url}' if target_url else ''}
+
+Generate realistic, working CSS selectors. Output ONLY the JSON object."""
+
+    try:
+        from tubecli.extensions.cloud_api.extension import key_manager
+        from tubecli.core.ai_generator import (
+            call_gemini, call_openai_compatible, call_claude, call_ollama, extract_json
+        )
+
+        # Try providers in order: deepseek → gemini → grok → openai → ollama
+        providers = ["deepseek", "gemini", "grok", "chatgpt", "ollama"]
+        raw = None
+        used_provider = None
+
+        for provider in providers:
+            api_key = key_manager.get_active_key(provider) if provider != "ollama" else ""
+            if not api_key and provider != "ollama":
+                continue
+
+            try:
+                if provider == "gemini":
+                    raw = call_gemini("gemini-2.0-flash", api_key, system_prompt)
+                elif provider == "deepseek":
+                    raw = call_openai_compatible("deepseek-chat", api_key, system_prompt, base_url="https://api.deepseek.com/v1")
+                elif provider == "grok":
+                    raw = call_openai_compatible("grok-3-mini-fast", api_key, system_prompt, base_url="https://api.x.ai/v1")
+                elif provider == "chatgpt":
+                    raw = call_openai_compatible("gpt-4o-mini", api_key, system_prompt)
+                elif provider == "ollama":
+                    raw = call_ollama("qwen2.5:7b", system_prompt)
+
+                if raw and not raw.startswith("[ERROR]") and not raw.startswith("[QUOTA_ERROR]"):
+                    used_provider = provider
+                    break
+            except Exception:
+                continue
+
+        if not raw or raw.startswith("[ERROR]") or raw.startswith("[QUOTA_ERROR]"):
+            raise HTTPException(500, f"AI generation failed: {raw or 'No API keys available'}")
+
+        json_str = extract_json(raw)
+        parsed = json.loads(json_str)
+
+        # Save to DB
+        script = _db().create_script(
+            name=parsed.get("name", script_name),
+            description=parsed.get("description", prompt_text),
+            category=parsed.get("category", "general"),
+            target_url=parsed.get("target_url", target_url),
+            steps=parsed.get("steps", []),
+            variables=parsed.get("variables", []),
+        )
+
+        return {
+            "status": "generated",
+            "script": script,
+            "provider": used_provider,
+            "steps_count": len(parsed.get("steps", [])),
+        }
+
+    except json.JSONDecodeError:
+        raise HTTPException(500, f"AI returned invalid JSON")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"AI generate error: {e}")
+        raise HTTPException(500, str(e))
+
+
+# ── Chat Bot (Script Assistant) ──
+
+@router.post("/chat")
+async def chat_with_script(request: Request):
+    """AI chat assistant for modifying/explaining scripts."""
+    body = await request.json()
+    message = body.get("message", "")
+    history = body.get("history", [])
+    script = body.get("script")
+
+    if not message:
+        raise HTTPException(400, "Missing 'message'")
+
+    script_context = ""
+    if script:
+        steps_summary = ""
+        for i, step in enumerate(script.get("steps", [])):
+            label = step.get("label", step.get("type", "?"))
+            sel = step.get("selector", "")
+            params = step.get("params", {})
+            steps_summary += f"  {i}: [{step.get('type')}] {label}"
+            if sel: steps_summary += f" (selector: {sel})"
+            if params.get("text"): steps_summary += f" text=\"{params['text']}\""
+            if params.get("url"): steps_summary += f" url={params['url']}"
+            if params.get("prompt"): steps_summary += f" prompt=\"{params['prompt']}\""
+            steps_summary += "\n"
+
+        script_context = f"Current script: \"{script.get('name', '')}\"\nSteps:\n{steps_summary}"
+
+    system_prompt = f"""You are Script Assistant for Script Studio (browser automation).
+Help users modify, explain, and improve their scripts.
+
+{script_context}
+
+Available step types: navigate, click, type, wait, sleep, scroll, mouse_move, hover, keyboard, evaluate, extract, screenshot, download, condition, loop, ai_generate.
+
+The "ai_generate" step generates dynamic text at runtime:
+- params.prompt: AI instruction (e.g. "Write a comment about this video")
+- params.extract_selector: CSS selector to get page context (e.g. "h1" for title)
+- params.save_as: variable name to store result
+- Use {{{{variable_name}}}} in subsequent type steps
+
+RULES:
+1. Reply in user's language.
+2. To MODIFY script, include JSON: {{"updated_steps": [full steps array]}}
+3. For explanations, use plain text only.
+4. Keep responses concise.
+
+User: {message}"""
+
+    try:
+        from tubecli.extensions.cloud_api.extension import key_manager
+        from tubecli.core.ai_generator import (
+            call_gemini, call_openai_compatible, call_ollama, extract_json
+        )
+
+        providers = ["deepseek", "gemini", "grok", "chatgpt", "ollama"]
+        raw = None
+
+        for provider in providers:
+            api_key = key_manager.get_active_key(provider) if provider != "ollama" else ""
+            if not api_key and provider != "ollama": continue
+            try:
+                if provider == "gemini":
+                    raw = call_gemini("gemini-2.0-flash", api_key, system_prompt)
+                elif provider == "deepseek":
+                    raw = call_openai_compatible("deepseek-chat", api_key, system_prompt, base_url="https://api.deepseek.com/v1")
+                elif provider == "grok":
+                    raw = call_openai_compatible("grok-3-mini-fast", api_key, system_prompt, base_url="https://api.x.ai/v1")
+                elif provider == "chatgpt":
+                    raw = call_openai_compatible("gpt-4o-mini", api_key, system_prompt)
+                elif provider == "ollama":
+                    raw = call_ollama("qwen2.5:7b", system_prompt)
+                if raw and not raw.startswith("[ERROR]") and not raw.startswith("[QUOTA_ERROR]"):
+                    break
+            except Exception: continue
+
+        if not raw:
+            return {"reply": "Không thể kết nối AI. Kiểm tra API keys.", "updated_steps": None}
+
+        updated_steps = None
+        reply = raw.replace("```json", "").replace("```", "").strip()
+
+        if '"updated_steps"' in raw:
+            try:
+                json_str = extract_json(raw)
+                parsed = json.loads(json_str)
+                if "updated_steps" in parsed:
+                    updated_steps = parsed["updated_steps"]
+                    reply = "Đã chỉnh sửa script theo yêu cầu."
+            except Exception: pass
+
+        if reply.startswith("{") and '"updated_steps"' in reply:
+            reply = "Đã chỉnh sửa script theo yêu cầu."
+
+        return {"reply": reply, "updated_steps": updated_steps}
+
+    except Exception as e:
+        logger.error(f"Chat error: {e}")
+        return {"reply": f"Lỗi: {str(e)}", "updated_steps": None}
+
+
+# ── AI Auto-Fix Selector ──
+
+@router.post("/ai-fix")
+async def ai_fix_selector(request: Request):
+    """AI analyzes page HTML and suggests correct CSS selector or recovery action."""
+    body = await request.json()
+    failed_selector = body.get("selector", "")
+    step_type = body.get("step_type", "click")
+    step_label = body.get("label", "")
+    error_msg = body.get("error", "")
+    page_html = body.get("page_html", "")[:15000]
+    page_url = body.get("page_url", "")
+    visible_text = body.get("visible_text", "")[:3000]
+
+    prompt = f"""You are a browser automation expert debugging a Playwright script.
+A step FAILED — the element was not visible/found within the timeout.
+
+IMPORTANT: The selector may actually be correct in the HTML, but something is BLOCKING it:
+- Cookie consent dialogs/banners
+- GDPR accept buttons
+- Login/signup modals
+- Age verification popups  
+- "Accept cookies" overlays
+- Any modal/dialog covering the page
+
+Page URL: {page_url}
+Step type: {step_type}
+Step label: {step_label}
+Failed selector: {failed_selector}
+Error: {error_msg}
+
+Visible text on page (what user sees):
+{visible_text}
+
+Page HTML (truncated):
+{page_html[:12000]}
+
+ANALYZE:
+1. Check: is there a consent dialog, cookie banner, overlay, or modal blocking the page?
+2. Look for buttons with text like "Accept all", "Accept", "I agree", "OK", "Continue", "Consent", "Reject all"
+3. If yes: provide CSS selectors to CLICK those buttons via Playwright (not JS evaluate)
+4. Check: is the original selector correct or suggest a better one?
+
+Output ONLY this JSON (no markdown):
+{{
+  "selector": "correct-css-selector-or-same-if-correct",
+  "pre_action_clicks": ["button[aria-label='Accept all']", "button.consent-accept"],
+  "pre_action_js": "optional JS to run after clicking, or empty string",
+  "reason": "brief explanation"
+}}
+
+RULES for pre_action_clicks:
+- Use real CSS selectors from the HTML above
+- These will be clicked using Playwright page.click() which handles web components
+- Include ALL possible selectors for the dismiss button (ordered by most likely)
+- If no overlay, use empty array []
+
+If selector is correct, keep it and focus on dismissing overlays."""
+
+    try:
+        from tubecli.extensions.cloud_api.extension import key_manager
+        from tubecli.core.ai_generator import (
+            call_gemini, call_openai_compatible, extract_json
+        )
+
+        providers = ["deepseek", "gemini", "grok"]
+        raw = None
+        for provider in providers:
+            api_key = key_manager.get_active_key(provider)
+            if not api_key:
+                continue
+            try:
+                if provider == "gemini":
+                    raw = call_gemini("gemini-2.0-flash", api_key, prompt)
+                elif provider == "deepseek":
+                    raw = call_openai_compatible("deepseek-chat", api_key, prompt, base_url="https://api.deepseek.com/v1")
+                elif provider == "grok":
+                    raw = call_openai_compatible("grok-3-mini-fast", api_key, prompt, base_url="https://api.x.ai/v1")
+                if raw and not raw.startswith("[ERROR]"):
+                    break
+            except Exception:
+                continue
+
+        if not raw or raw.startswith("[ERROR]"):
+            return {"status": "no_fix", "reason": "AI unavailable"}
+
+        json_str = extract_json(raw)
+        parsed = json.loads(json_str)
+        return {
+            "status": "fixed",
+            "selector": parsed.get("selector", ""),
+            "pre_action_clicks": parsed.get("pre_action_clicks", []),
+            "pre_action_js": parsed.get("pre_action_js", ""),
+            "reason": parsed.get("reason", ""),
+        }
+    except Exception as e:
+        return {"status": "no_fix", "reason": str(e)}
+
+
+# ── Skill API ──
+
+@router.get("/skill/{slug}")
+async def get_skill_script(slug: str):
+    """Get a script by slug — used by other extensions."""
+    script = _db().get_script_by_slug(slug)
+    if not script:
+        raise HTTPException(404, f"Script '{slug}' not found")
+    return script
+
+@router.post("/skill/{slug}/run")
+async def run_skill_script(slug: str, request: Request):
+    """Run a script by slug — used by other extensions."""
+    script = _db().get_script_by_slug(slug)
+    if not script:
+        raise HTTPException(404, f"Script '{slug}' not found")
+    body = await request.json()
+    req = RunRequest(
+        profile=body.get("profile", ""),
+        variables=body.get("variables", {}),
+        headless=body.get("headless", True),
+    )
+    return await run_script(script["id"], req)
+
+
+# ── Import/Export ──
+
+@router.post("/import/json")
+async def import_json(request: Request):
+    """Import a script from JSON."""
+    body = await request.json()
+    script_data = body.get("script", {})
+    if not script_data.get("name"):
+        raise HTTPException(400, "Missing script name")
+    script = _db().create_script(
+        name=script_data["name"],
+        slug=script_data.get("slug"),
+        description=script_data.get("description", ""),
+        category=script_data.get("category", "general"),
+        target_url=script_data.get("target_url", ""),
+        tags=script_data.get("tags", []),
+        steps=script_data.get("steps", []),
+        variables=script_data.get("variables", []),
+    )
+    return {"status": "imported", "script": script}
+
+@router.get("/{script_id}/export/json")
+async def export_json(script_id: int):
+    script = _db().get_script(script_id)
+    if not script:
+        raise HTTPException(404, "Script not found")
+    # Remove DB-only fields
+    export = {k: v for k, v in script.items() if k not in ("id", "created_at", "updated_at")}
+    return {"script": export}
+
+
+# ── Import JS (AI Parser) ──
+
+@router.post("/import/js")
+async def import_js_file(request: Request):
+    """Import a .js automation file — parse into Script Studio steps using AI."""
+    body = await request.json()
+    js_content = body.get("content", "")
+    filename = body.get("filename", "imported.js")
+    use_ai = body.get("use_ai", True)
+
+    if not js_content:
+        raise HTTPException(400, "Missing 'content' field")
+
+    import sys
+    ext_dir = os.path.dirname(os.path.abspath(__file__))
+    if ext_dir not in sys.path:
+        sys.path.insert(0, ext_dir)
+
+    from parser.ai_parser import parse_js_to_steps, ai_parse_js_to_steps
+
+    if use_ai:
+        parsed = await ai_parse_js_to_steps(js_content, filename)
+    else:
+        parsed = parse_js_to_steps(js_content, filename)
+
+    # Save to DB
+    script = _db().create_script(
+        name=parsed.get("name", filename),
+        description=parsed.get("description", ""),
+        category=parsed.get("category", "general"),
+        target_url=parsed.get("target_url", ""),
+        steps=parsed.get("steps", []),
+        variables=parsed.get("variables", []),
+    )
+    return {
+        "status": "imported",
+        "script": script,
+        "parsed_steps": len(parsed.get("steps", [])),
+        "parsed_variables": len(parsed.get("variables", [])),
+    }
+
+@router.post("/import/js/parse")
+async def parse_js_preview(request: Request):
+    """Preview parsing without saving — returns parsed steps for review."""
+    body = await request.json()
+    js_content = body.get("content", "")
+    filename = body.get("filename", "preview.js")
+    use_ai = body.get("use_ai", True)
+
+    if not js_content:
+        raise HTTPException(400, "Missing 'content' field")
+
+    import sys
+    ext_dir = os.path.dirname(os.path.abspath(__file__))
+    if ext_dir not in sys.path:
+        sys.path.insert(0, ext_dir)
+
+    from parser.ai_parser import parse_js_to_steps, ai_parse_js_to_steps
+
+    if use_ai:
+        parsed = await ai_parse_js_to_steps(js_content, filename)
+    else:
+        parsed = parse_js_to_steps(js_content, filename)
+
+    return {"status": "parsed", "result": parsed}
+
+
+# ── Elements ──
+
+@router.get("/{script_id}/elements")
+async def list_elements(script_id: int):
+    return {"elements": _db().list_elements(script_id)}
+
+@router.post("/{script_id}/elements")
+async def save_element(script_id: int, request: Request):
+    body = await request.json()
+    elem_id = _db().save_element(
+        script_id=script_id,
+        step_index=body.get("step_index", 0),
+        name=body.get("name", ""),
+        selector=body.get("selector", ""),
+        xpath=body.get("xpath", ""),
+        screenshot=body.get("screenshot", ""),
+        attributes=body.get("attributes", {}),
+        page_url=body.get("page_url", ""),
+    )
+    return {"status": "saved", "element_id": elem_id}
