@@ -582,6 +582,9 @@ async function pollExecution() {
                 document.getElementById('btnRun').disabled = false;
                 document.getElementById('btnStop').disabled = true;
                 document.getElementById('btnPause').disabled = true;
+                // Refresh profile cache (cookies/fingerprint may have changed during execution)
+                const profile = document.getElementById('execProfile')?.value;
+                if (profile) loadProfileData(profile);
             }
         } catch (e) {}
     }, 800);

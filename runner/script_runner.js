@@ -619,6 +619,13 @@ async function executeStepWithRetry(page, step, index) {
             
             const msg = `Step ${index} failed (attempt ${attempt + 1}/${retryCount + 1}): ${err.message}`;
             stepLog(index, step.type, msg);
+            
+            // If overlay is blocking clicks, skip remaining retries → go straight to popup dismiss
+            if (err.message.includes('intercepts pointer events') || err.message.includes('overlay')) {
+                stepLog(index, step.type, '🔔 Overlay detected blocking clicks, dismissing...');
+                attempt = retryCount; // Skip to post-retry fix phase
+            }
+            
             if (attempt < retryCount) {
                 await sleep(retryDelay);
                 continue;
@@ -629,7 +636,93 @@ async function executeStepWithRetry(page, step, index) {
                                     err.message.includes('waiting for') ||
                                     err.message.includes('locator');
 
-            // ── Phase 0: Auto 2FA Handler ──
+            // ── Phase 0: Auto-dismiss popup/overlay (most common blocker) ──
+            try {
+                const dismissed = await page.evaluate(() => {
+                    // ── Step A: Check required checkboxes in modals/dialogs ──
+                    const modalContainers = document.querySelectorAll(
+                        '[role="dialog"], [class*="modal"], [class*="dialog"], [class*="overlay"], [class*="popup"], ' +
+                        '.cdk-overlay-container, .cdk-overlay-pane, [class*="cdk-overlay"]'
+                    );
+                    for (const container of modalContainers) {
+                        const rect = container.getBoundingClientRect();
+                        // cdk-overlay-container is full-screen, so skip size check for it
+                        const isCDK = container.classList?.contains('cdk-overlay-container');
+                        if (!isCDK && rect.width === 0 && rect.height === 0) continue;
+                        // Find unchecked checkboxes (native + Angular Material mat-checkbox)
+                        const checkboxes = container.querySelectorAll(
+                            'input[type="checkbox"]:not(:checked), [role="checkbox"][aria-checked="false"], ' +
+                            'mat-checkbox:not(.mat-mdc-checkbox-checked), .mat-checkbox:not(.mat-checkbox-checked)'
+                        );
+                        for (const cb of checkboxes) {
+                            const label = cb.closest('label')?.textContent || cb.closest('mat-checkbox')?.textContent || cb.parentElement?.textContent || '';
+                            // Check agreement/terms/acknowledge checkboxes
+                            if (label.match(/agree|acknowledge|accept|terms|consent|developer|đồng ý|chấp nhận|xác nhận/i)) {
+                                // For mat-checkbox, click the label or the checkbox wrapper
+                                const clickTarget = cb.querySelector('input[type="checkbox"]') || cb.querySelector('.mdc-checkbox') || cb;
+                                clickTarget.click();
+                            }
+                        }
+                    }
+
+                    // ── Step B: Find and click dismiss/continue buttons ──
+                    const closeSelectors = [
+                        '[aria-label="Close"]', '[aria-label="Dismiss"]', '[aria-label="Đóng"]',
+                        'button.close', 'button[class*="close"]', 'button[class*="dismiss"]',
+                        '[class*="modal"] button', '[class*="dialog"] button',
+                        '[role="dialog"] button', '[class*="overlay"] button',
+                        '.cdk-overlay-pane button', '.cdk-overlay-container button', // Angular CDK
+                        'button[id*="accept"]', 'button[id*="agree"]', 'button[id*="consent"]',
+                        '[class*="cookie"] button', '[class*="consent"] button',
+                        'button[jsname="tWT92d"]', 'button[jsname="b3VHJd"]',
+                        '.VfPpkd-LgbsSe.VfPpkd-LgbsSe-OWXEXe-k8QpJ',
+                    ];
+                    const dismissTexts = /^(ok|close|dismiss|got it|accept|agree|i agree|continue|proceed|confirm|đóng|đồng ý|x|✕|✖|×|tôi đồng ý|skip|bỏ qua|later|để sau|tiếp tục|xác nhận)$/i;
+                    
+                    let found = false;
+                    for (const sel of closeSelectors) {
+                        const btns = document.querySelectorAll(sel);
+                        for (const btn of btns) {
+                            const rect = btn.getBoundingClientRect();
+                            const style = window.getComputedStyle(btn);
+                            if (rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden') {
+                                const text = (btn.textContent || '').trim().toLowerCase();
+                                if (dismissTexts.test(text) ||
+                                    btn.getAttribute('aria-label')?.match(/close|dismiss|đóng/i) ||
+                                    text === '') {
+                                    btn.click();
+                                    found = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if (found) break;
+                    }
+                    
+                    // ── Step C: Escape fallback ──
+                    if (!found) {
+                        const modal = document.querySelector('[role="dialog"]:not([style*="display: none"]), [class*="modal"]:not([style*="display: none"])');
+                        if (modal) {
+                            document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', keyCode: 27 }));
+                            found = true;
+                        }
+                    }
+                    return found;
+                }).catch(() => false);
+
+                if (dismissed) {
+                    stepLog(index, step.type, '🔔 Auto-dismissed popup/overlay! Retrying step...');
+                    await sleep(1000);
+                    try {
+                        await executeStep(page, step, index);
+                        return; // Step succeeded after dismissing popup
+                    } catch (retryErr) {
+                        stepLog(index, step.type, `Step still failed after popup dismiss, continuing fix...`);
+                    }
+                }
+            } catch (popupErr) {}
+
+            // ── Phase 1: Auto 2FA Handler (only when on 2FA page) ──
             // If step failed and page is on a 2FA challenge, handle it automatically
             try {
                 const currentUrl = page.url() || '';
@@ -744,7 +837,7 @@ async function executeStepWithRetry(page, step, index) {
 
             if (isSelectorError && (step.selector || step.type === 'wait' || step.type === 'navigate')) {
 
-                // ─── Phase 1: Smart Selector Finder (no AI, instant) ───
+                // ─── Phase 2: Smart Selector Finder (no AI, instant) ───
                 stepLog(index, step.type, '🔍 Smart fix: probing page for element...');
                 const origSelector = step.selector;
                 let smartFixed = false;
