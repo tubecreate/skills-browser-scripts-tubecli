@@ -34,7 +34,6 @@ class ScriptDatabase:
         conn = sqlite3.connect(self.db_path, timeout=10)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA foreign_keys=ON")
         return conn
 
     def _init_schema(self):
@@ -59,15 +58,14 @@ class ScriptDatabase:
 
                 CREATE TABLE IF NOT EXISTS executions (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    script_id INTEGER,
+                    script_id TEXT DEFAULT '',
                     profile_name TEXT DEFAULT '',
                     status TEXT DEFAULT 'pending',
                     variables TEXT DEFAULT '{}',
                     result TEXT DEFAULT '{}',
                     log TEXT DEFAULT '',
                     started_at TIMESTAMP,
-                    finished_at TIMESTAMP,
-                    FOREIGN KEY (script_id) REFERENCES scripts(id) ON DELETE CASCADE
+                    finished_at TIMESTAMP
                 );
 
                 CREATE TABLE IF NOT EXISTS elements (

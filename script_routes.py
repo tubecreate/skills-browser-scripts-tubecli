@@ -248,7 +248,7 @@ async def run_script(script_id: str, req: RunRequest):
     if not script:
         raise HTTPException(404, "Script not found")
 
-    exec_id = _db().create_execution(0, req.profile, req.variables)
+    exec_id = _db().create_execution(script_id, req.profile, req.variables)
 
     ext_dir = os.path.dirname(os.path.abspath(__file__))
     runner_path = os.path.join(ext_dir, "runner", "script_runner.js")
