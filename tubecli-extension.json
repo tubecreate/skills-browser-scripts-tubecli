@@ -1,7 +1,7 @@
 ﻿{
     "name":  "browser_scripts",
     "display_name":  "Browser Scripts",
-    "version":  "2026.05.05.171728",
+    "version":  "2026.05.05.201315",
     "description":  "Script Studio — Visual browser automation script editor \u0026 manager",
     "author":  "TubeCreate",
     "entry":  "extension.py",

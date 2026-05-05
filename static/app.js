@@ -89,17 +89,17 @@ function renderScriptList() {
         return;
     }
     list.innerHTML = scripts.map(s => `
-        <div class="script-item ${currentScript?.id === s.id ? 'active' : ''}" onclick="selectScript(${s.id})">
-            <div class="script-item-name">${esc(s.name)}</div>
+        <div class="script-item ${currentScript?.id === (s.slug || s.id) ? 'active' : ''}" onclick="selectScript('${esc(s.slug || s.id)}')">
+            <div class="script-item-name">${s.is_function ? '📦 ' : ''}${esc(s.name)}</div>
             <div class="script-item-meta">
                 <span>${getCategoryIcon(s.category)} ${s.category}</span>
                 <span>${(s.steps || []).length} steps</span>
             </div>
             <div class="script-item-actions">
-                <button class="step-action-btn" onclick="event.stopPropagation();duplicateScript(${s.id})" title="Duplicate">
+                <button class="step-action-btn" onclick="event.stopPropagation();duplicateScript('${esc(s.slug || s.id)}')" title="Duplicate">
                     <span class="material-symbols-outlined" style="font-size:0.9rem">content_copy</span>
                 </button>
-                <button class="step-action-btn" onclick="event.stopPropagation();deleteScript(${s.id})" title="Delete">
+                <button class="step-action-btn" onclick="event.stopPropagation();deleteScript('${esc(s.slug || s.id)}')" title="Delete">
                     <span class="material-symbols-outlined" style="font-size:0.9rem">delete</span>
                 </button>
             </div>
@@ -107,8 +107,11 @@ function renderScriptList() {
     `).join('');
 }
 
-async function selectScript(id) {
-    currentScript = await api(`${API}/${id}`);
+async function selectScript(idOrSlug) {
+    currentScript = await api(`${API}/${idOrSlug}`);
+    if (currentScript && currentScript.slug) {
+        currentScript.id = currentScript.slug; // Use slug as primary key
+    }
     document.getElementById('currentScriptName').textContent = currentScript.name;
     renderScriptList();
     renderSteps();
@@ -131,20 +134,20 @@ async function createNewScript() {
     closeModal('newScriptModal');
     document.getElementById('newScriptName').value = '';
     await loadScripts();
-    if (data.script) selectScript(data.script.id);
+    if (data.script) selectScript(data.script.slug || data.script.id);
 }
 
-async function deleteScript(id) {
+async function deleteScript(slug) {
     if (!confirm('Delete this script?')) return;
-    await api(`${API}/${id}`, { method: 'DELETE' });
-    if (currentScript?.id === id) currentScript = null;
+    await api(`${API}/${slug}`, { method: 'DELETE' });
+    if (currentScript?.id === slug) currentScript = null;
     loadScripts();
 }
 
-async function duplicateScript(id) {
-    const data = await api(`${API}/${id}/duplicate`, { method: 'POST' });
+async function duplicateScript(slug) {
+    const data = await api(`${API}/${slug}/duplicate`, { method: 'POST' });
     await loadScripts();
-    if (data.script) selectScript(data.script.id);
+    if (data.script) selectScript(data.script.slug || data.script.id);
 }
 
 // ── Steps ──
@@ -152,7 +155,8 @@ const STEP_ICONS = {
     navigate: 'language', click: 'ads_click', type: 'keyboard', wait: 'hourglass_empty',
     sleep: 'timer', evaluate: 'code', extract: 'content_copy', screenshot: 'screenshot_monitor',
     download: 'download', condition: 'call_split', loop: 'loop', keyboard: 'keyboard_return',
-    wait_hidden: 'visibility_off', scroll: 'swap_vert', mouse_move: 'mouse', hover: 'near_me', ai_generate: 'auto_awesome',
+    wait_hidden: 'visibility_off', scroll: 'swap_vert', mouse_move: 'mouse', hover: 'near_me',
+    ai_generate: 'auto_awesome', call_function: 'functions',
 };
 
 function renderSteps() {
@@ -219,6 +223,11 @@ function renderStepBody(step, idx) {
         html += `<div class="form-group"><label>Iterations</label><input type="number" class="form-input" value="${p.count || 1}" onchange="updateStepParam(${idx},'count',+this.value)"></div>`;
         html += `<div class="form-group"><label>Delay between (ms)</label><input type="number" class="form-input" value="${p.delay || 1000}" onchange="updateStepParam(${idx},'delay',+this.value)"></div>`;
     }
+    if (step.type === 'call_function') {
+        html += `<div class="form-group"><label>Function Slug</label><input class="form-input" value="${esc(p.function_slug || '')}" onchange="updateStepParam(${idx},'function_slug',this.value)" placeholder="gmail_login_with_2fa"></div>`;
+        html += `<div class="form-group"><label>Inputs (JSON: {"fn_var": "{{caller_var}}"})</label><textarea class="form-input" rows="3" style="font-family:var(--mono)" onchange="try{updateStepParam(${idx},'inputs',JSON.parse(this.value))}catch(e){}">${esc(JSON.stringify(p.inputs || {}, null, 2))}</textarea></div>`;
+        html += `<div class="form-group"><label>Outputs (JSON: {"caller_var": "fn_output_var"})</label><textarea class="form-input" rows="2" style="font-family:var(--mono)" onchange="try{updateStepParam(${idx},'outputs',JSON.parse(this.value))}catch(e){}">${esc(JSON.stringify(p.outputs || {}, null, 2))}</textarea></div>`;
+    }
 
     // Error handling
     html += `<div style="display:flex;gap:8px;margin-top:8px">`;
@@ -272,7 +281,7 @@ async function insertStep(type) {
         });
         if (data.script) {
             await loadScripts();
-            await selectScript(data.script.id);
+            await selectScript(data.script.slug || data.script.id);
         }
         if (!currentScript) return;
     }
@@ -1230,7 +1239,7 @@ async function importScriptPrompt() {
                     body: JSON.stringify({ content: text, filename: file.name, use_ai: true })
                 });
                 await loadScripts();
-                if (data.script) selectScript(data.script.id);
+                if (data.script) selectScript(data.script.slug || data.script.id);
                 appendLog(`Imported! ${data.parsed_steps || 0} steps, ${data.parsed_variables || 0} variables`, 'success');
             } else {
                 // JSON import
@@ -1240,7 +1249,7 @@ async function importScriptPrompt() {
                     body: JSON.stringify({ script: json.script || json })
                 });
                 await loadScripts();
-                if (data.script) selectScript(data.script.id);
+                if (data.script) selectScript(data.script.slug || data.script.id);
                 appendLog('Script imported!', 'success');
             }
         } catch (e) { appendLog('Import failed: ' + e.message, 'error'); }
@@ -1271,7 +1280,7 @@ async function doAIGenerate() {
         if (data.script) {
             statusText.textContent = `✅ Tạo thành công! ${data.steps_count} steps (${data.provider})`;
             await loadScripts();
-            await selectScript(data.script.id);
+            await selectScript(data.script.slug || data.script.id);
             appendLog(`AI generated script: ${data.script.name} (${data.steps_count} steps via ${data.provider})`, 'success');
 
             setTimeout(() => {

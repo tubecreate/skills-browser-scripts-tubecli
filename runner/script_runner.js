@@ -592,6 +592,59 @@ async function executeStep(page, step, index) {
             }
             break;
         }
+        case 'call_function': {
+            const fnSlug = interpolate(params.function_slug || params.slug || '');
+            if (!fnSlug) {
+                stepLog(index, type, `❌ call_function: missing function_slug`);
+                break;
+            }
+
+            stepLog(index, type, `📦 Calling function: ${fnSlug}`);
+
+            // Load function script from scripts/ directory
+            const scriptsDir = execData.scripts_dir || path.join(__dirname, '..', 'scripts');
+            const fnPath = path.join(scriptsDir, `${fnSlug}.json`);
+
+            if (!fs.existsSync(fnPath)) {
+                stepLog(index, type, `❌ Function not found: ${fnPath}`);
+                break;
+            }
+
+            const fnScript = JSON.parse(fs.readFileSync(fnPath, 'utf-8'));
+            const fnSteps = fnScript.steps || [];
+
+            if (!fnSteps.length) {
+                stepLog(index, type, `⚠️ Function ${fnSlug} has no steps`);
+                break;
+            }
+
+            // Map caller variables → function inputs (scoped)
+            const savedVars = { ...variables };
+            const inputMap = params.inputs || {};
+            for (const [fnVar, callerExpr] of Object.entries(inputMap)) {
+                variables[fnVar] = interpolate(String(callerExpr));
+            }
+
+            stepLog(index, type, `📦 Executing ${fnSteps.length} function steps...`);
+
+            // Execute function steps
+            for (let i = 0; i < fnSteps.length; i++) {
+                await executeStepWithRetry(page, fnSteps[i], `${index}.fn.${i}`);
+            }
+
+            // Map function outputs → caller variables
+            const outputMap = params.outputs || {};
+            for (const [callerVar, fnVar] of Object.entries(outputMap)) {
+                savedVars[callerVar] = variables[fnVar];
+            }
+
+            // Restore caller scope (but keep outputs)
+            Object.keys(variables).forEach(k => delete variables[k]);
+            Object.assign(variables, savedVars);
+
+            stepLog(index, type, `✅ Function ${fnSlug} completed`);
+            break;
+        }
         default:
             stepLog(index, type, `Unknown step type: ${type}`);
     }

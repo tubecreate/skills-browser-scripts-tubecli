@@ -35,9 +35,29 @@ async def serve_static(filename: str):
         return FileResponse(filepath, media_type=media, headers={"Cache-Control": "no-cache, no-store, must-revalidate"})
     raise HTTPException(404, "File not found")
 
+_store_mod = None
 _db_mod = None
 
+def _store():
+    """Get JSON-based ScriptStore instance."""
+    global _store_mod
+    if _store_mod is None:
+        import importlib.util
+        ext_dir = os.path.dirname(os.path.abspath(__file__))
+        store_file = os.path.join(ext_dir, "db", "script_store.py")
+        spec = importlib.util.spec_from_file_location("script_store", store_file)
+        _store_mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(_store_mod)
+
+    store = _store_mod.ScriptStore.get_instance()
+    if store is None:
+        ext_dir = os.path.dirname(os.path.abspath(__file__))
+        scripts_dir = os.path.join(ext_dir, "scripts")
+        store = _store_mod.ScriptStore.get_instance(scripts_dir)
+    return store
+
 def _db():
+    """Get SQLite DB for execution history only."""
     global _db_mod
     if _db_mod is None:
         import importlib.util
@@ -46,10 +66,9 @@ def _db():
         spec = importlib.util.spec_from_file_location("script_studio_db", db_file)
         _db_mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(_db_mod)
-    
+
     db = _db_mod.ScriptDatabase.get_instance()
     if db is None:
-        # Init DB if not yet initialized
         from tubecli.config import DATA_DIR
         db_dir = os.path.join(str(DATA_DIR), "browser_scripts")
         os.makedirs(db_dir, exist_ok=True)
@@ -94,6 +113,9 @@ class ScriptCreate(BaseModel):
     steps: List[dict] = []
     variables: List[dict] = []
     is_template: bool = False
+    is_function: bool = False
+    function_inputs: List[dict] = []
+    function_outputs: List[dict] = []
 
 class ScriptUpdate(BaseModel):
     name: Optional[str] = None
@@ -105,6 +127,9 @@ class ScriptUpdate(BaseModel):
     steps: Optional[List[dict]] = None
     variables: Optional[List[dict]] = None
     is_template: Optional[bool] = None
+    is_function: Optional[bool] = None
+    function_inputs: Optional[List[dict]] = None
+    function_outputs: Optional[List[dict]] = None
 
 class RunRequest(BaseModel):
     profile: str = ""
@@ -117,47 +142,84 @@ class RunRequest(BaseModel):
 
 @router.get("")
 async def list_scripts(category: Optional[str] = None):
-    scripts = _db().list_scripts(category)
+    scripts = _store().list_scripts(category)
     return {"scripts": scripts}
 
 @router.post("")
 async def create_script(req: ScriptCreate):
     try:
-        script = _db().create_script(
+        script = _store().create_script(
             name=req.name, slug=req.slug, description=req.description,
             category=req.category, target_url=req.target_url,
             tags=req.tags, steps=req.steps, variables=req.variables,
-            is_template=req.is_template,
+            is_template=req.is_template, is_function=req.is_function,
+            function_inputs=req.function_inputs, function_outputs=req.function_outputs,
         )
         return {"status": "created", "script": script}
     except Exception as e:
         raise HTTPException(400, str(e))
 
+@router.get("/functions")
+async def list_functions():
+    """List all scripts marked as functions."""
+    functions = _store().list_functions()
+    # Return lightweight list (no steps)
+    return {"functions": [
+        {
+            "slug": f["slug"], "name": f["name"], "description": f.get("description", ""),
+            "function_inputs": f.get("function_inputs", []),
+            "function_outputs": f.get("function_outputs", []),
+            "category": f.get("category", "general"),
+            "tags": f.get("tags", []),
+        }
+        for f in functions
+    ]}
+
+@router.get("/functions/{slug}")
+async def get_function(slug: str):
+    """Get function detail by slug (includes steps for runner)."""
+    script = _store().get_script(slug)
+    if not script or not script.get("is_function"):
+        raise HTTPException(404, "Function not found")
+    return script
+
+@router.get("/by-slug/{slug}")
+async def get_script_by_slug(slug: str):
+    """Get script by slug."""
+    script = _store().get_script(slug)
+    if not script:
+        raise HTTPException(404, "Script not found")
+    return script
+
 @router.get("/{script_id}")
-async def get_script(script_id: int):
-    script = _db().get_script(script_id)
+async def get_script(script_id: str):
+    """Get script by slug (or legacy numeric ID)."""
+    script = _store().get_script(script_id)
+    if not script:
+        # Backward compat: try as numeric ID
+        script = _store().get_script_by_id(int(script_id)) if script_id.isdigit() else None
     if not script:
         raise HTTPException(404, "Script not found")
     return script
 
 @router.put("/{script_id}")
-async def update_script(script_id: int, req: ScriptUpdate):
+async def update_script(script_id: str, req: ScriptUpdate):
     data = req.model_dump(exclude_none=True)
     if not data:
         raise HTTPException(400, "No fields to update")
-    script = _db().update_script(script_id, **data)
+    script = _store().update_script(script_id, **data)
     if not script:
         raise HTTPException(404, "Script not found")
     return {"status": "updated", "script": script}
 
 @router.delete("/{script_id}")
-async def delete_script(script_id: int):
-    _db().delete_script(script_id)
+async def delete_script(script_id: str):
+    _store().delete_script(script_id)
     return {"status": "deleted"}
 
 @router.post("/{script_id}/duplicate")
-async def duplicate_script(script_id: int):
-    script = _db().duplicate_script(script_id)
+async def duplicate_script(script_id: str):
+    script = _store().duplicate_script(script_id)
     if not script:
         raise HTTPException(404, "Script not found")
     return {"status": "duplicated", "script": script}
@@ -166,10 +228,10 @@ async def duplicate_script(script_id: int):
 # ── Steps ──
 
 @router.put("/{script_id}/steps")
-async def update_steps(script_id: int, request: Request):
+async def update_steps(script_id: str, request: Request):
     body = await request.json()
     steps = body.get("steps", [])
-    script = _db().update_script(script_id, steps=steps)
+    script = _store().update_script(script_id, steps=steps)
     if not script:
         raise HTTPException(404, "Script not found")
     return {"status": "updated", "steps": script.get("steps", [])}
@@ -181,12 +243,12 @@ _running_processes = {}
 _running_logs = {}  # exec_id -> list of log lines (real-time)
 
 @router.post("/{script_id}/run")
-async def run_script(script_id: int, req: RunRequest):
-    script = _db().get_script(script_id)
+async def run_script(script_id: str, req: RunRequest):
+    script = _store().get_script(script_id)
     if not script:
         raise HTTPException(404, "Script not found")
 
-    exec_id = _db().create_execution(script_id, req.profile, req.variables)
+    exec_id = _db().create_execution(0, req.profile, req.variables)
 
     ext_dir = os.path.dirname(os.path.abspath(__file__))
     runner_path = os.path.join(ext_dir, "runner", "script_runner.js")
@@ -204,6 +266,7 @@ async def run_script(script_id: int, req: RunRequest):
             "engine": req.engine,
             "exec_id": exec_id,
             "profiles_dir": _get_profiles_dir(),
+            "scripts_dir": os.path.join(ext_dir, "scripts"),
         }, f, ensure_ascii=False, indent=2)
 
     _running_logs[exec_id] = []
@@ -592,8 +655,8 @@ Generate realistic, working CSS selectors. Use language-agnostic selectors (IDs,
         json_str = extract_json(raw)
         parsed = json.loads(json_str)
 
-        # Save to DB
-        script = _db().create_script(
+        # Save to JSON
+        script = _store().create_script(
             name=parsed.get("name", script_name),
             description=parsed.get("description", prompt_text),
             category=parsed.get("category", "general"),
@@ -835,7 +898,7 @@ If selector is correct, keep it and focus on dismissing overlays."""
 @router.get("/skill/{slug}")
 async def get_skill_script(slug: str):
     """Get a script by slug — used by other extensions."""
-    script = _db().get_script_by_slug(slug)
+    script = _store().get_script(slug)
     if not script:
         raise HTTPException(404, f"Script '{slug}' not found")
     return script
@@ -843,7 +906,7 @@ async def get_skill_script(slug: str):
 @router.post("/skill/{slug}/run")
 async def run_skill_script(slug: str, request: Request):
     """Run a script by slug — used by other extensions."""
-    script = _db().get_script_by_slug(slug)
+    script = _store().get_script(slug)
     if not script:
         raise HTTPException(404, f"Script '{slug}' not found")
     body = await request.json()
@@ -852,7 +915,7 @@ async def run_skill_script(slug: str, request: Request):
         variables=body.get("variables", {}),
         headless=body.get("headless", True),
     )
-    return await run_script(script["id"], req)
+    return await run_script(slug, req)
 
 
 # ── Import/Export ──
@@ -864,7 +927,7 @@ async def import_json(request: Request):
     script_data = body.get("script", {})
     if not script_data.get("name"):
         raise HTTPException(400, "Missing script name")
-    script = _db().create_script(
+    script = _store().create_script(
         name=script_data["name"],
         slug=script_data.get("slug"),
         description=script_data.get("description", ""),
@@ -877,12 +940,11 @@ async def import_json(request: Request):
     return {"status": "imported", "script": script}
 
 @router.get("/{script_id}/export/json")
-async def export_json(script_id: int):
-    script = _db().get_script(script_id)
+async def export_json(script_id: str):
+    script = _store().get_script(script_id)
     if not script:
         raise HTTPException(404, "Script not found")
-    # Remove DB-only fields
-    export = {k: v for k, v in script.items() if k not in ("id", "created_at", "updated_at")}
+    export = {k: v for k, v in script.items() if k not in ("created_at", "updated_at")}
     return {"script": export}
 
 
@@ -911,8 +973,8 @@ async def import_js_file(request: Request):
     else:
         parsed = parse_js_to_steps(js_content, filename)
 
-    # Save to DB
-    script = _db().create_script(
+    # Save to JSON
+    script = _store().create_script(
         name=parsed.get("name", filename),
         description=parsed.get("description", ""),
         category=parsed.get("category", "general"),
