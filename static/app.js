@@ -7,32 +7,43 @@ let currentScript = null;
 let scripts = [];
 let previewSession = null;
 let pickerActive = false;
+let cachedProfileData = null; // Cached profile info (loaded once, updated on profile change)
 
 // ── Init ──
 document.addEventListener('DOMContentLoaded', () => {
     loadScripts();
-    loadProfiles();
+    loadProfiles().then(() => {
+        // Load cached profile data for the initially selected profile
+        const sel = document.getElementById('execProfile');
+        if (sel && sel.value) loadProfileData(sel.value);
+    });
     setupEventListeners();
     setupResizeHandles();
+
+    // Restore last selected engine from localStorage
+    const savedEngine = localStorage.getItem('scriptStudio_engine');
+    if (savedEngine) {
+        const engineEl = document.getElementById('execEngine');
+        if (engineEl) engineEl.value = savedEngine;
+    }
+
+    // Save engine selection on change
+    document.getElementById('execEngine')?.addEventListener('change', (e) => {
+        localStorage.setItem('scriptStudio_engine', e.target.value);
+    });
+
+    // Save profile selection on change → reload profile data
+    document.getElementById('execProfile')?.addEventListener('change', (e) => {
+        if (e.target.value) {
+            localStorage.setItem('scriptStudio_profile', e.target.value);
+            loadProfileData(e.target.value);
+        } else {
+            cachedProfileData = null;
+        }
+    });
 });
 
-async function loadProfiles() {
-    try {
-        const res = await fetch('/api/v1/browser/profiles');
-        const data = await res.json();
-        const profiles = data.profiles || [];
-        const select = document.getElementById('execProfile');
-        select.innerHTML = '<option value="">Select Profile...</option>';
-        profiles.forEach(p => {
-            const opt = document.createElement('option');
-            opt.value = p.name;
-            opt.textContent = `${p.name}${p.google_account ? ' (' + p.google_account.email + ')' : ''}`;
-            select.appendChild(opt);
-        });
-    } catch (e) {
-        console.warn('Could not load browser profiles:', e);
-    }
-}
+
 
 function setupEventListeners() {
     document.getElementById('btnNewScript').onclick = () => showModal('newScriptModal');
@@ -386,8 +397,20 @@ async function saveSettings() {
 let currentExecId = null;
 
 async function runScript() {
-    if (!currentScript) return;
+    if (!currentScript) {
+        showToast('⚠️ Vui lòng chọn một script trước khi chạy', 'warning');
+        return;
+    }
     const profile = document.getElementById('execProfile').value;
+    if (!profile) {
+        showToast('⚠️ Vui lòng chọn Browser Profile trước khi chạy', 'warning');
+        // Highlight the profile dropdown briefly
+        const sel = document.getElementById('execProfile');
+        sel.style.outline = '2px solid #f59e0b';
+        sel.focus();
+        setTimeout(() => { sel.style.outline = ''; }, 2000);
+        return;
+    }
     const vars = {};
     (currentScript.variables || []).forEach(v => { if (v.name) vars[v.name] = v.default || ''; });
     const showBrowser = document.getElementById('showBrowserToggle')?.checked || false;
@@ -605,7 +628,31 @@ function connectPreviewWS(port) {
     previewCtx = previewCanvas.getContext('2d');
 
     try {
-        previewWs = new WebSocket(`ws://localhost:${port}`);
+        // Detect if accessed via remote domain (tunnel) — use server proxy
+        const isRemote = location.hostname !== 'localhost' && location.hostname !== '127.0.0.1';
+        let wsUrl;
+        if (isRemote) {
+            // Proxy through main server: wss://domain/api/v1/scripts/preview/ws/{port}
+            const wsProto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+            wsUrl = `${wsProto}//${location.host}/api/v1/scripts/preview/ws/${port}`;
+        } else {
+            wsUrl = `ws://localhost:${port}`;
+        }
+        appendLog(`Connecting preview: ${wsUrl}`, 'info');
+        previewWs = new WebSocket(wsUrl);
+
+        // Timeout: if WS doesn't connect within 5s, fall back to screenshots
+        const wsTimeout = setTimeout(() => {
+            if (previewWs && previewWs.readyState !== 1) {
+                appendLog('WebSocket timeout, falling back to screenshots', 'info');
+                try { previewWs.close(); } catch (e) {}
+                previewWs = null;
+                startScreenshotStream();
+            }
+        }, 5000);
+
+        const origOnOpen = null;
+        previewWs._clearTimeout = () => clearTimeout(wsTimeout);
     } catch (e) {
         appendLog('WebSocket failed, falling back to screenshots', 'error');
         startScreenshotStream();
@@ -613,6 +660,9 @@ function connectPreviewWS(port) {
     }
 
     previewWs.onopen = () => {
+        if (previewWs._clearTimeout) previewWs._clearTimeout();
+        window._wsReconnectAttempt = 0; // Reset reconnect counter
+        stopScreenshotStream(); // Stop fallback screenshots if they were running
         appendLog('🔴 Live preview connected (WebSocket)', 'success');
     };
 
@@ -687,9 +737,27 @@ function connectPreviewWS(port) {
         } catch (e) {}
     };
 
-    previewWs.onclose = () => {
-        appendLog('Preview disconnected', 'info');
+    previewWs.onclose = (evt) => {
         previewWs = null;
+        // Auto-reconnect unless intentionally closed (code 1000)
+        if (evt.code !== 1000 && port) {
+            const attempt = (window._wsReconnectAttempt || 0) + 1;
+            window._wsReconnectAttempt = attempt;
+            if (attempt <= 5) {
+                const delay = Math.min(attempt * 2000, 10000);
+                appendLog(`Preview disconnected — reconnecting in ${delay / 1000}s (attempt ${attempt}/5)`, 'info');
+                startScreenshotStream(); // Fallback during reconnect
+                setTimeout(() => {
+                    if (!previewWs) connectPreviewWS(port);
+                }, delay);
+            } else {
+                appendLog('Preview disconnected — max reconnect attempts reached, using screenshots', 'info');
+                startScreenshotStream();
+                window._wsReconnectAttempt = 0;
+            }
+        } else {
+            appendLog('Preview disconnected', 'info');
+        }
     };
 
     previewWs.onerror = () => {
@@ -796,7 +864,11 @@ function startScreenshotStream() {
         const buf = new Image();
         buf.onload = () => { img.src = buf.src; loading = false; };
         buf.onerror = () => { loading = false; };
-        buf.src = `http://localhost:${previewSession.port}/screenshot?t=${Date.now()}`;
+        const isRemote = location.hostname !== 'localhost' && location.hostname !== '127.0.0.1';
+        const screenshotUrl = isRemote
+            ? `${location.origin}/api/v1/scripts/preview/screenshot/${previewSession.port}?t=${Date.now()}`
+            : `http://localhost:${previewSession.port}/screenshot?t=${Date.now()}`;
+        buf.src = screenshotUrl;
     }, 1000);
 }
 
@@ -872,7 +944,94 @@ async function loadProfiles() {
         const profiles = data.profiles || [];
         select.innerHTML = '<option value="">Select Profile...</option>' +
             profiles.map(p => `<option value="${p.name}">${p.name}</option>`).join('');
+
+        // Restore last selected profile from localStorage
+        const savedProfile = localStorage.getItem('scriptStudio_profile');
+        if (savedProfile) {
+            const exists = profiles.some(p => p.name === savedProfile);
+            if (exists) select.value = savedProfile;
+        }
     } catch (e) {}
+}
+
+// Load profile data into cache (called once on init & on profile change)
+async function loadProfileData(profileName) {
+    if (!profileName) { cachedProfileData = null; return; }
+    try {
+        const data = await api(`/api/v1/browser/profiles/${encodeURIComponent(profileName)}`);
+        // Also fetch cookies count
+        let cookieCount = 0;
+        try {
+            const cookieData = await api(`/api/v1/browser/profiles/${encodeURIComponent(profileName)}/cookies`);
+            cookieCount = cookieData.count || 0;
+        } catch (e) {}
+        cachedProfileData = { ...data, cookie_count: cookieCount, _loaded_at: Date.now() };
+    } catch (e) {
+        cachedProfileData = null;
+    }
+}
+
+// ── Create Profile ──
+function showCreateProfileDialog() {
+    document.getElementById('newProfileName').value = '';
+    document.getElementById('newProfileProxy').value = '';
+    document.getElementById('newProfileWidth').value = '1920';
+    document.getElementById('newProfileHeight').value = '1080';
+    document.querySelectorAll('input[name="profileTag"]').forEach(cb => {
+        cb.checked = cb.value === 'Windows' || cb.value === 'Chrome';
+    });
+    const errEl = document.getElementById('createProfileError');
+    errEl.style.display = 'none';
+    errEl.textContent = '';
+    showModal('createProfileModal');
+    setTimeout(() => document.getElementById('newProfileName').focus(), 200);
+}
+
+async function doCreateProfile() {
+    const name = document.getElementById('newProfileName').value.trim();
+    const proxy = document.getElementById('newProfileProxy').value.trim();
+    const width = parseInt(document.getElementById('newProfileWidth').value) || 1920;
+    const height = parseInt(document.getElementById('newProfileHeight').value) || 1080;
+    const tags = Array.from(document.querySelectorAll('input[name="profileTag"]:checked')).map(cb => cb.value);
+    const errEl = document.getElementById('createProfileError');
+
+    if (!name) {
+        errEl.textContent = '⚠️ Profile name is required';
+        errEl.style.display = 'block';
+        document.getElementById('newProfileName').focus();
+        return;
+    }
+
+    const btn = document.getElementById('btnDoCreateProfile');
+    const origText = btn.innerHTML;
+    btn.disabled = true;
+    btn.innerHTML = '<span class="material-symbols-outlined" style="animation:spin 1s linear infinite">progress_activity</span> Creating...';
+
+    try {
+        const resp = await fetch('/api/v1/browser/profiles', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name, proxy, tags, window_size: { width, height } })
+        });
+        if (!resp.ok) {
+            const errData = await resp.json().catch(() => ({}));
+            throw new Error(errData.detail || `HTTP ${resp.status}`);
+        }
+        const data = await resp.json();
+        closeModal('createProfileModal');
+        showToast(`✅ Profile "${data.profile?.name || name}" created!`, 'success');
+        await loadProfiles();
+        const select = document.getElementById('execProfile');
+        const safeName = data.profile?.name || name.replace(/[^a-zA-Z0-9_-]/g, '');
+        select.value = safeName;
+        localStorage.setItem('scriptStudio_profile', safeName);
+    } catch (err) {
+        errEl.textContent = `❌ ${err.message}`;
+        errEl.style.display = 'block';
+    } finally {
+        btn.disabled = false;
+        btn.innerHTML = origText;
+    }
 }
 
 // ── History ──
@@ -896,6 +1055,158 @@ async function loadHistory() {
             </div>
         `).join('');
     } catch (e) {}
+}
+
+// ── Profile Settings ──
+function showProfileSettings() {
+    const profile = document.getElementById('execProfile').value;
+    if (!profile) {
+        showToast('⚠️ Select a profile first', 'warning');
+        return;
+    }
+    document.getElementById('profileSettingsName').textContent = `📂 ${profile}`;
+    document.getElementById('profileSettingsError').style.display = 'none';
+    document.getElementById('profileSettingsSuccess').style.display = 'none';
+
+    // Use cached profile data — no API call needed
+    const data = cachedProfileData || {};
+    document.getElementById('settingsProxy').value = data.proxy || '';
+    document.getElementById('settingsWidth').value = data.window_size?.width || 1920;
+    document.getElementById('settingsHeight').value = data.window_size?.height || 1080;
+
+    // Fingerprint status
+    const hasFP = data.has_fingerprint;
+    document.getElementById('fingerprintStatus').textContent = hasFP ? '✅ Loaded' : '❌ Not found';
+    document.getElementById('fingerprintStatus').style.color = hasFP ? 'var(--success)' : 'var(--danger)';
+
+    // Cookies status from cache
+    const cookieCount = data.cookie_count || 0;
+    document.getElementById('cookiesStatus').textContent = cookieCount > 0 ? `🍪 ${cookieCount} cookies` : '❌ No cookies';
+    document.getElementById('cookiesStatus').style.color = cookieCount > 0 ? 'var(--success)' : 'var(--text-muted)';
+
+    showModal('profileSettingsModal');
+}
+
+async function saveProfileSettings() {
+    const profile = document.getElementById('execProfile').value;
+    if (!profile) return;
+
+    const proxy = document.getElementById('settingsProxy').value.trim();
+    const width = parseInt(document.getElementById('settingsWidth').value) || 1920;
+    const height = parseInt(document.getElementById('settingsHeight').value) || 1080;
+
+    const errEl = document.getElementById('profileSettingsError');
+    const okEl = document.getElementById('profileSettingsSuccess');
+    errEl.style.display = 'none';
+    okEl.style.display = 'none';
+
+    try {
+        await api(`/api/v1/browser/profiles/${encodeURIComponent(profile)}`, {
+            method: 'PUT',
+            body: JSON.stringify({ proxy, window_size: { width, height } })
+        });
+        // Update cache locally
+        if (cachedProfileData) {
+            cachedProfileData.proxy = proxy;
+            cachedProfileData.window_size = { width, height };
+        }
+        okEl.textContent = '✅ Settings saved!';
+        okEl.style.display = 'block';
+        setTimeout(() => { okEl.style.display = 'none'; }, 3000);
+    } catch (e) {
+        errEl.textContent = `❌ ${e.message}`;
+        errEl.style.display = 'block';
+    }
+}
+
+async function refreshFingerprint() {
+    const profile = document.getElementById('execProfile').value;
+    if (!profile) return;
+
+    const btn = document.getElementById('btnRefreshFP');
+    const origHTML = btn.innerHTML;
+    btn.disabled = true;
+    btn.innerHTML = '<span class="material-symbols-outlined" style="animation:spin 1s linear infinite;font-size:16px">progress_activity</span> Refreshing...';
+    document.getElementById('fingerprintStatus').textContent = '⏳ Fetching new fingerprint...';
+    document.getElementById('fingerprintStatus').style.color = 'var(--warning)';
+
+    try {
+        await api(`/api/v1/browser/profiles/${encodeURIComponent(profile)}/fingerprint/refresh`, { method: 'POST' });
+        if (cachedProfileData) cachedProfileData.has_fingerprint = true;
+        document.getElementById('fingerprintStatus').textContent = '✅ Refreshed!';
+        document.getElementById('fingerprintStatus').style.color = 'var(--success)';
+        showToast('✅ Fingerprint refreshed!', 'success');
+    } catch (e) {
+        document.getElementById('fingerprintStatus').textContent = '❌ Failed';
+        document.getElementById('fingerprintStatus').style.color = 'var(--danger)';
+        showToast(`❌ ${e.message}`, 'error');
+    } finally {
+        btn.disabled = false;
+        btn.innerHTML = origHTML;
+    }
+}
+
+async function exportCookies() {
+    const profile = document.getElementById('execProfile').value;
+    if (!profile) return;
+
+    try {
+        const data = await api(`/api/v1/browser/profiles/${encodeURIComponent(profile)}/cookies`);
+        if (!data.cookies || data.cookies.length === 0) {
+            showToast('❌ No cookies to export', 'warning');
+            return;
+        }
+        const blob = new Blob([JSON.stringify(data.cookies, null, 2)], { type: 'application/json' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `${profile}_cookies.json`;
+        a.click();
+        URL.revokeObjectURL(url);
+        showToast(`✅ Exported ${data.cookies.length} cookies`, 'success');
+    } catch (e) {
+        showToast(`❌ Export failed: ${e.message}`, 'error');
+    }
+}
+
+async function importCookies(input) {
+    const profile = document.getElementById('execProfile').value;
+    if (!profile || !input.files.length) return;
+
+    const file = input.files[0];
+    try {
+        const text = await file.text();
+        const cookies = JSON.parse(text);
+        await api(`/api/v1/browser/profiles/${encodeURIComponent(profile)}/cookies`, {
+            method: 'POST',
+            body: JSON.stringify({ cookies: Array.isArray(cookies) ? cookies : [cookies] })
+        });
+        const count = Array.isArray(cookies) ? cookies.length : 1;
+        if (cachedProfileData) cachedProfileData.cookie_count = count;
+        document.getElementById('cookiesStatus').textContent = `🍪 ${count} cookies`;
+        document.getElementById('cookiesStatus').style.color = 'var(--success)';
+        showToast(`✅ Imported ${count} cookies`, 'success');
+    } catch (e) {
+        showToast(`❌ Import failed: ${e.message}`, 'error');
+    }
+    input.value = ''; // Reset file input
+}
+
+async function deleteCookies() {
+    const profile = document.getElementById('execProfile').value;
+    if (!profile) return;
+
+    if (!confirm(`Delete all cookies for profile "${profile}"?`)) return;
+
+    try {
+        await api(`/api/v1/browser/profiles/${encodeURIComponent(profile)}/cookies`, { method: 'DELETE' });
+        if (cachedProfileData) cachedProfileData.cookie_count = 0;
+        document.getElementById('cookiesStatus').textContent = '❌ No cookies';
+        document.getElementById('cookiesStatus').style.color = 'var(--text-muted)';
+        showToast('✅ Cookies deleted', 'success');
+    } catch (e) {
+        showToast(`❌ ${e.message}`, 'error');
+    }
 }
 
 // ── Import ──
@@ -1118,4 +1429,46 @@ async function sendChat() {
         typingDiv.remove();
         addChatMsg('bot', `❌ Lỗi: ${e.message}`);
     }
+}
+
+// ── Toast Notification ──
+function showToast(message, type = 'info') {
+    // Remove any existing toast
+    const existing = document.getElementById('scriptStudioToast');
+    if (existing) existing.remove();
+
+    const colors = {
+        warning: { bg: 'linear-gradient(135deg, #f59e0b, #d97706)', icon: '⚠️' },
+        error:   { bg: 'linear-gradient(135deg, #ef4444, #dc2626)', icon: '❌' },
+        success: { bg: 'linear-gradient(135deg, #10b981, #059669)', icon: '✅' },
+        info:    { bg: 'linear-gradient(135deg, #3b82f6, #2563eb)', icon: 'ℹ️' },
+    };
+    const c = colors[type] || colors.info;
+
+    const toast = document.createElement('div');
+    toast.id = 'scriptStudioToast';
+    toast.innerHTML = `${c.icon} ${esc(message)}`;
+    Object.assign(toast.style, {
+        position: 'fixed', top: '16px', left: '50%', transform: 'translateX(-50%) translateY(-20px)',
+        padding: '12px 24px', borderRadius: '12px', background: c.bg,
+        color: '#fff', fontWeight: '600', fontSize: '14px', fontFamily: 'Inter, sans-serif',
+        boxShadow: '0 8px 32px rgba(0,0,0,0.3)', zIndex: '99999',
+        opacity: '0', transition: 'all 0.3s ease', cursor: 'pointer',
+        backdropFilter: 'blur(8px)', border: '1px solid rgba(255,255,255,0.15)',
+    });
+    toast.onclick = () => { toast.style.opacity = '0'; setTimeout(() => toast.remove(), 300); };
+    document.body.appendChild(toast);
+
+    // Animate in
+    requestAnimationFrame(() => {
+        toast.style.opacity = '1';
+        toast.style.transform = 'translateX(-50%) translateY(0)';
+    });
+
+    // Auto dismiss
+    setTimeout(() => {
+        toast.style.opacity = '0';
+        toast.style.transform = 'translateX(-50%) translateY(-20px)';
+        setTimeout(() => toast.remove(), 300);
+    }, 3500);
 }

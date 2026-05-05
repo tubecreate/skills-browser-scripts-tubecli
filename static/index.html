@@ -8,7 +8,7 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
     <link href="https://fonts.googleapis.com/icon?family=Material+Symbols+Outlined" rel="stylesheet">
-    <link rel="stylesheet" href="/script-studio/styles.css">
+    <link rel="stylesheet" href="/script-studio/styles.css?v=20260505">
 </head>
 <body>
     <div id="app">
@@ -153,9 +153,12 @@
                         <select id="execProfile" class="form-input form-input-sm">
                             <option value="">Select Profile...</option>
                         </select>
+                        <button id="btnAddProfile" class="btn btn-sm btn-icon" onclick="showCreateProfileDialog()" title="Create new profile">
+                            <span class="material-symbols-outlined" style="font-size:16px">add</span>
+                        </button>
                         <select id="execEngine" class="form-input form-input-sm" title="Browser engine">
                             <option value="playwright">⚡ Playwright</option>
-                            <option value="bablosoft">🛡️ Bablosoft</option>
+                            <option value="bablosoft">🛡️ Security Browser</option>
                         </select>
                         <label class="exec-toggle" title="Show Browser: mở cửa sổ riêng">
                             <input type="checkbox" id="showBrowserToggle">
@@ -201,6 +204,9 @@
                     <div class="preview-actions">
                         <button id="btnLaunchPreview" class="btn btn-sm btn-accent" onclick="launchPreview()">
                             <span class="material-symbols-outlined">open_in_browser</span> Launch
+                        </button>
+                        <button id="btnProfileSettings" class="btn btn-sm btn-ghost" onclick="showProfileSettings()" title="Profile Settings">
+                            <span class="material-symbols-outlined">settings</span>
                         </button>
                         <button id="btnPicker" class="btn btn-sm btn-ghost" onclick="togglePicker()" title="Element Picker">
                             <span class="material-symbols-outlined">my_location</span>
@@ -375,7 +381,122 @@
             </div>
         </div>
     </div>
+    <!-- Create Profile Modal -->
+    <div id="createProfileModal" class="modal" style="display:none">
+        <div class="modal-backdrop" onclick="closeModal('createProfileModal')"></div>
+        <div class="modal-content" style="max-width:420px">
+            <h3 style="display:flex;align-items:center;gap:8px">
+                <span class="material-symbols-outlined">person_add</span> Create New Profile
+            </h3>
+            <div class="form-group">
+                <label>Profile Name <span style="color:var(--accent)">*</span></label>
+                <input type="text" id="newProfileName" class="form-input" placeholder="e.g. profile_youtube_01" autocomplete="off">
+            </div>
+            <div class="form-group">
+                <label>Proxy <span style="color:var(--text-muted)">(optional)</span></label>
+                <input type="text" id="newProfileProxy" class="form-input" placeholder="http://user:pass@host:port">
+            </div>
+            <div class="form-group">
+                <label>OS / Browser Tags</label>
+                <div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:4px">
+                    <label class="tag-check"><input type="checkbox" name="profileTag" value="Windows" checked> <span>Windows</span></label>
+                    <label class="tag-check"><input type="checkbox" name="profileTag" value="macOS"> <span>macOS</span></label>
+                    <label class="tag-check"><input type="checkbox" name="profileTag" value="Chrome" checked> <span>Chrome</span></label>
+                </div>
+            </div>
+            <div class="form-group">
+                <label>Window Size</label>
+                <div style="display:flex;gap:8px;align-items:center">
+                    <input type="number" id="newProfileWidth" class="form-input" value="1920" style="width:100px" min="800" max="3840">
+                    <span style="color:var(--text-muted)">×</span>
+                    <input type="number" id="newProfileHeight" class="form-input" value="1080" style="width:100px" min="600" max="2160">
+                </div>
+            </div>
+            <div id="createProfileError" style="color:var(--danger);font-size:13px;margin-bottom:8px;display:none"></div>
+            <div class="modal-actions">
+                <button class="btn btn-ghost" onclick="closeModal('createProfileModal')">Cancel</button>
+                <button id="btnDoCreateProfile" class="btn btn-primary" onclick="doCreateProfile()">
+                    <span class="material-symbols-outlined">add</span> Create Profile
+                </button>
+            </div>
+        </div>
+    </div>
 
-    <script src="/script-studio/app.js"></script>
+    <!-- Profile Settings Modal -->
+    <div id="profileSettingsModal" class="modal" style="display:none">
+        <div class="modal-backdrop" onclick="closeModal('profileSettingsModal')"></div>
+        <div class="modal-content" style="max-width:480px">
+            <h3 style="display:flex;align-items:center;gap:8px;margin-bottom:4px">
+                <span class="material-symbols-outlined">settings</span>
+                Profile Settings
+            </h3>
+            <div id="profileSettingsName" style="font-size:0.82rem;color:var(--accent);margin-bottom:16px;font-weight:500"></div>
+
+            <!-- Proxy -->
+            <div class="settings-section">
+                <label class="settings-label">
+                    <span class="material-symbols-outlined" style="font-size:16px">vpn_key</span> Proxy
+                </label>
+                <input type="text" id="settingsProxy" class="form-input" placeholder="http://user:pass@host:port">
+            </div>
+
+            <!-- Window Size -->
+            <div class="settings-section">
+                <label class="settings-label">
+                    <span class="material-symbols-outlined" style="font-size:16px">aspect_ratio</span> Window Size
+                </label>
+                <div style="display:flex;gap:8px;align-items:center">
+                    <input type="number" id="settingsWidth" class="form-input" style="width:100px" min="800" max="3840">
+                    <span style="color:var(--text-muted)">×</span>
+                    <input type="number" id="settingsHeight" class="form-input" style="width:100px" min="600" max="2160">
+                </div>
+            </div>
+
+            <!-- Fingerprint -->
+            <div class="settings-section">
+                <label class="settings-label">
+                    <span class="material-symbols-outlined" style="font-size:16px">fingerprint</span> Fingerprint
+                </label>
+                <div style="display:flex;gap:8px;align-items:center">
+                    <span id="fingerprintStatus" style="font-size:0.8rem;color:var(--text-muted)">—</span>
+                    <button class="btn btn-sm btn-ghost" onclick="refreshFingerprint()" id="btnRefreshFP">
+                        <span class="material-symbols-outlined" style="font-size:16px">refresh</span> Refresh
+                    </button>
+                </div>
+            </div>
+
+            <!-- Cookies -->
+            <div class="settings-section">
+                <label class="settings-label">
+                    <span class="material-symbols-outlined" style="font-size:16px">cookie</span> Cookies
+                </label>
+                <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+                    <span id="cookiesStatus" style="font-size:0.8rem;color:var(--text-muted)">—</span>
+                    <button class="btn btn-sm btn-ghost" onclick="exportCookies()">
+                        <span class="material-symbols-outlined" style="font-size:16px">download</span> Export
+                    </button>
+                    <label class="btn btn-sm btn-ghost" style="cursor:pointer;margin:0">
+                        <span class="material-symbols-outlined" style="font-size:16px">upload</span> Import
+                        <input type="file" id="importCookiesFile" accept=".json" style="display:none" onchange="importCookies(this)">
+                    </label>
+                    <button class="btn btn-sm btn-ghost" onclick="deleteCookies()" style="color:var(--danger)">
+                        <span class="material-symbols-outlined" style="font-size:16px">delete</span>
+                    </button>
+                </div>
+            </div>
+
+            <div id="profileSettingsError" style="color:var(--danger);font-size:13px;margin-top:8px;display:none"></div>
+            <div id="profileSettingsSuccess" style="color:var(--success);font-size:13px;margin-top:8px;display:none"></div>
+
+            <div class="modal-actions">
+                <button class="btn btn-ghost" onclick="closeModal('profileSettingsModal')">Close</button>
+                <button class="btn btn-primary" onclick="saveProfileSettings()">
+                    <span class="material-symbols-outlined">save</span> Save
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <script>document.write('<scr'+'ipt src="/script-studio/app.js?v='+Date.now()+'"><\/scr'+'ipt>')</script>
 </body>
 </html>

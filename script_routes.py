@@ -21,14 +21,18 @@ _EXT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 @ui_router.get("/script-studio")
 async def serve_ui():
-    return FileResponse(os.path.join(_EXT_DIR, "static", "index.html"), media_type="text/html")
+    return FileResponse(
+        os.path.join(_EXT_DIR, "static", "index.html"),
+        media_type="text/html",
+        headers={"Cache-Control": "no-cache, no-store, must-revalidate"}
+    )
 
 @ui_router.get("/script-studio/{filename:path}")
 async def serve_static(filename: str):
     filepath = os.path.join(_EXT_DIR, "static", filename)
     if os.path.isfile(filepath):
         media = "text/css" if filename.endswith(".css") else "application/javascript" if filename.endswith(".js") else "application/octet-stream"
-        return FileResponse(filepath, media_type=media)
+        return FileResponse(filepath, media_type=media, headers={"Cache-Control": "no-cache, no-store, must-revalidate"})
     raise HTTPException(404, "File not found")
 
 _db_mod = None
@@ -106,7 +110,7 @@ class RunRequest(BaseModel):
     profile: str = ""
     variables: dict = {}
     headless: bool = True
-    engine: str = "playwright"  # "playwright" or "bablosoft"
+    engine: str = "playwright"  # "playwright" or "bablosoft" (Security Browser)
 
 
 # ── Script CRUD ──
@@ -343,6 +347,103 @@ async def stop_preview(request: Request):
     return {"status": "not_found"}
 
 
+# ── WebSocket Proxy for Remote Access ──
+# When accessing via tunnel domain, ws://localhost:{port} is unreachable.
+# This endpoint proxies WebSocket traffic through the main server.
+
+from fastapi import WebSocket, WebSocketDisconnect
+import asyncio
+
+@router.websocket("/preview/ws/{port}")
+async def ws_preview_proxy(websocket: WebSocket, port: int):
+    """Proxy WebSocket connection to the local preview server."""
+    await websocket.accept()
+    logger.info(f"[WS Proxy] Client connected, proxying to localhost:{port}")
+    
+    local_ws = None
+    try:
+        import aiohttp
+        session = aiohttp.ClientSession()
+        local_ws = await session.ws_connect(f"http://localhost:{port}", timeout=10)
+        logger.info(f"[WS Proxy] Connected to local preview server on port {port}")
+        
+        async def forward_to_local():
+            """Client → Local preview server"""
+            try:
+                while True:
+                    data = await websocket.receive_text()
+                    await local_ws.send_str(data)
+            except (WebSocketDisconnect, Exception):
+                pass
+        
+        async def forward_to_client():
+            """Local preview server → Client"""
+            try:
+                async for msg in local_ws:
+                    if msg.type == aiohttp.WSMsgType.TEXT:
+                        await websocket.send_text(msg.data)
+                    elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                        break
+            except Exception:
+                pass
+        
+        async def heartbeat():
+            """Keep connection alive through reverse proxies (Cloudflare, nginx)"""
+            try:
+                while True:
+                    await asyncio.sleep(15)
+                    try:
+                        await local_ws.ping()
+                    except Exception:
+                        break
+            except asyncio.CancelledError:
+                pass
+        
+        # Run all three tasks concurrently
+        done, pending = await asyncio.wait(
+            [asyncio.create_task(forward_to_local()),
+             asyncio.create_task(forward_to_client()),
+             asyncio.create_task(heartbeat())],
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for task in pending:
+            task.cancel()
+    except ImportError:
+        logger.error("[WS Proxy] aiohttp not installed. Run: pip install aiohttp")
+        try:
+            await websocket.close(code=1011, reason="aiohttp not installed on server")
+        except Exception:
+            pass
+    except Exception as e:
+        logger.error(f"[WS Proxy] Error: {e}")
+        try:
+            await websocket.close(code=1011, reason=str(e)[:120])
+        except Exception:
+            pass
+    finally:
+        if local_ws:
+            await local_ws.close()
+            await session.close()
+
+
+# ── Screenshot proxy for remote access ──
+@router.get("/preview/screenshot/{port}")
+async def proxy_screenshot(port: int):
+    """Proxy screenshot from local preview server for remote access."""
+    import asyncio
+    try:
+        import requests as _requests
+        resp = await asyncio.to_thread(
+            _requests.get, f"http://localhost:{port}/screenshot", timeout=10
+        )
+        if resp.status_code == 200:
+            from fastapi.responses import Response
+            return Response(content=resp.content, media_type="image/jpeg")
+    except Exception as e:
+        logger.error(f"[Screenshot Proxy] Error: {e}")
+    raise HTTPException(502, "Preview server unavailable")
+
+
 # ── AI Generate Script ──
 
 @router.post("/generate")
@@ -376,15 +477,57 @@ Available step types:
 - condition: If/else. params: {{ check: "JS expression", then_steps: [...], else_steps: [...] }}
 - loop: Repeat steps. params: {{ count: number, delay: number, steps: [...], break_on: "JS expression" }}
 - download: Download file. selector: trigger element, params: {{ output_dir: string, filename: string }}
+- fetch_otp: Fetch TOTP/2FA code from system API. params: {{ secret: "{{{{totp_secret}}}}", save_as: "otp_code" }}
+
+SYSTEM 2FA/OTP API:
+The system has a built-in TOTP API for automatic 2FA code generation.
+Use the "fetch_otp" step type to get OTP codes during login flows.
+
+To handle 2FA in scripts:
+  {{ "type": "fetch_otp", "label": "Get 2FA code", "params": {{ "secret": "{{{{totp_secret}}}}", "save_as": "otp_code" }} }}
+  {{ "type": "type", "label": "Enter 2FA code", "selector": "input#totpPin, input[name='totpPin'], input[type='tel'], input[autocomplete='one-time-code']", "params": {{ "text": "{{{{otp_code}}}}", "clear_first": true }} }}
+
+When generating LOGIN scripts that involve 2FA:
+- Add a variable: {{ "name": "totp_secret", "default": "", "description": "TOTP/2FA secret key (base32)" }}
+- After the password step, add a condition to check if 2FA page appeared
+- Use fetch_otp to get the code, then type it
+
+Google 2FA selectors (language-agnostic):
+- 2FA input: input#totpPin, input[name="totpPin"], input[type="tel"], input[autocomplete="one-time-code"]
+- Next button after 2FA: #totpNext button, button[jsname="LgbsSe"]
 
 CRITICAL RULES FOR HUMAN-LIKE BEHAVIOR:
 1. Add a "sleep" step (1000-3000ms) between major actions (after navigate, after click, before type)
 2. Add "scroll" steps before interacting with elements below the fold (comment sections, footers)
-3. Add "hover" steps before clicking important elements (buttons, links, videos)
-4. Add "mouse_move" steps occasionally between actions for idle mouse movement
+3. MANDATORY: Before EVERY "click" step, add a "hover" step on the SAME selector. The mouse cursor must visually move to the button/element before clicking. This simulates a real human who moves their hand to the button before pressing.
+   Pattern: hover(selector) → sleep(300-800ms) → click(selector)
+4. Add "mouse_move" steps with random positions between unrelated actions to simulate idle mouse drift
 5. After loading a page, add a "sleep" (2000-4000ms) to simulate reading
 6. Use "scroll" with direction "down" and amount 300-500 to reveal lower content naturally
 7. Between typing and pressing Enter, add a short "sleep" (500-1500ms)
+8. Before typing in an input, add "hover" on the input selector first, then "sleep" 200-500ms, then "click" on it, then "type"
+9. Use "mouse_move" without specific x/y (random) when transitioning between different page sections
+
+CRITICAL RULES FOR PAGE STATE TRACKING:
+10. MANDATORY: After EVERY click that causes page navigation (clicking a link, search result, submit button, "Next" button, login button), you MUST add a "wait" step for a KEY ELEMENT on the NEW page BEFORE any further interaction.
+    Pattern: click(link) → wait(element_on_new_page, timeout: 15000) → sleep(2000) → next action
+11. MANDATORY: After a form submit or login click, add a "wait" for an element that ONLY exists on the success/next page (e.g. wait for dashboard, wait for profile icon, wait for the next form field).
+12. After clicking a search button or pressing Enter to search, ALWAYS add a "wait" step for the search results container before interacting with results.
+13. NEVER put two consecutive "click" steps that target different pages without a "wait" between them.
+14. If a click might trigger a CAPTCHA, popup, or modal, add a "sleep" (3000-5000ms) after the click AND a "wait" with retry_count: 2 for the expected next element.
+
+WRONG (no page state tracking — will fail):
+  click(a.search-result) → click(#like-button)  ← #like-button doesn't exist yet!
+
+RIGHT (waits for new page before interacting):
+  click(a.search-result) → wait(#video-player, timeout: 15000) → sleep(2000) → hover(#like-button) → click(#like-button)
+
+COMPLETE FLOW EXAMPLE for clicking a link that navigates:
+  {{ "type": "hover", "label": "Hover over first result", "selector": "a.result-link" }}
+  {{ "type": "sleep", "label": "Pause before click", "params": {{ "ms": 500 }} }}
+  {{ "type": "click", "label": "Click first result", "selector": "a.result-link" }}
+  {{ "type": "wait", "label": "Wait for new page to load", "selector": "body main, #content, article", "params": {{ "state": "visible", "timeout": 15000 }} }}
+  {{ "type": "sleep", "label": "Read new page", "params": {{ "ms": 3000 }} }}
 
 Variables can be referenced with {{{{var_name}}}} in any string field.
 
@@ -407,7 +550,7 @@ Output format (JSON only, no markdown):
 User request: {prompt_text}
 {f'Target URL: {target_url}' if target_url else ''}
 
-Generate realistic, working CSS selectors. Output ONLY the JSON object."""
+Generate realistic, working CSS selectors. Use language-agnostic selectors (IDs, data-attributes, roles) over text-based selectors. Output ONLY the JSON object."""
 
     try:
         from tubecli.extensions.cloud_api.extension import key_manager
@@ -509,7 +652,7 @@ Help users modify, explain, and improve their scripts.
 
 {script_context}
 
-Available step types: navigate, click, type, wait, sleep, scroll, mouse_move, hover, keyboard, evaluate, extract, screenshot, download, condition, loop, ai_generate.
+Available step types: navigate, click, type, wait, sleep, scroll, mouse_move, hover, keyboard, evaluate, extract, screenshot, download, condition, loop, ai_generate, fetch_otp.
 
 The "ai_generate" step generates dynamic text at runtime:
 - params.prompt: AI instruction (e.g. "Write a comment about this video")
@@ -517,11 +660,22 @@ The "ai_generate" step generates dynamic text at runtime:
 - params.save_as: variable name to store result
 - Use {{{{variable_name}}}} in subsequent type steps
 
+SYSTEM 2FA/OTP API:
+- API: GET /api/v1/browser/2fa?secret=<BASE32_SECRET> → returns {{"code": "123456", "remaining": 25}}
+- To auto-fill 2FA: use "evaluate" step to fetch code, save to variable, then "type" the variable
+- Example: evaluate(code: "const r = await fetch('/api/v1/browser/2fa?secret='+encodeURIComponent('{{{{totp_secret}}}}'));const d=await r.json();return d.code;", save_as: "otp_code") → type(selector: "input#totpPin", text: "{{{{otp_code}}}}")
+- Google 2FA selectors: input#totpPin, input[name="totpPin"], input[type="tel"], input[autocomplete="one-time-code"]
+
 RULES:
 1. Reply in user's language.
 2. To MODIFY script, include JSON: {{"updated_steps": [full steps array]}}
 3. For explanations, use plain text only.
 4. Keep responses concise.
+5. MANDATORY: Before EVERY "click" step, always add a "hover" step with the SAME selector, then a "sleep" (300-800ms). The cursor must move to the element before clicking. Pattern: hover → sleep → click.
+6. Before typing in an input, add hover → sleep → click → type.
+7. Use language-agnostic selectors (IDs, data-attributes, roles) over text-based selectors.
+8. MANDATORY: After EVERY click that causes page navigation (link, submit, search), add a "wait" step for a KEY element on the NEW page before any further interaction. Pattern: click → wait(new_page_element, timeout:15000) → sleep(2000).
+9. NEVER put two consecutive clicks targeting different pages without a "wait" between them.
 
 User: {message}"""
 

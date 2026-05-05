@@ -46,10 +46,96 @@ function bezierPoint(p0, p1, p2, p3, t) {
     };
 }
 
+// ── Visual Cursor Overlay (red dot + trail) ──
+const CURSOR_INJECT_JS = `
+(function() {
+    if (document.getElementById('__tubecli_cursor')) return;
+    
+    // Main cursor dot
+    const cursor = document.createElement('div');
+    cursor.id = '__tubecli_cursor';
+    cursor.style.cssText = 'position:fixed;width:16px;height:16px;border-radius:50%;' +
+        'background:radial-gradient(circle, #ff3333 30%, rgba(255,51,51,0.6) 70%);' +
+        'box-shadow:0 0 8px 2px rgba(255,0,0,0.5);pointer-events:none;z-index:2147483647;' +
+        'transition:left 0.02s linear,top 0.02s linear;transform:translate(-50%,-50%);' +
+        'display:none;';
+    document.body.appendChild(cursor);
+    
+    // Trail canvas
+    const canvas = document.createElement('canvas');
+    canvas.id = '__tubecli_trail';
+    canvas.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;' +
+        'pointer-events:none;z-index:2147483646;';
+    canvas.width = window.innerWidth;
+    canvas.height = window.innerHeight;
+    document.body.appendChild(canvas);
+    const ctx = canvas.getContext('2d');
+    
+    // Resize handler
+    window.addEventListener('resize', () => {
+        canvas.width = window.innerWidth;
+        canvas.height = window.innerHeight;
+    });
+    
+    // Trail fading
+    let trailPoints = [];
+    setInterval(() => {
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        const now = Date.now();
+        trailPoints = trailPoints.filter(p => now - p.t < 2000);
+        if (trailPoints.length < 2) return;
+        for (let i = 1; i < trailPoints.length; i++) {
+            const age = (now - trailPoints[i].t) / 2000;
+            const alpha = Math.max(0, 0.6 - age);
+            const width = Math.max(1, 3 * (1 - age));
+            ctx.beginPath();
+            ctx.moveTo(trailPoints[i-1].x, trailPoints[i-1].y);
+            ctx.lineTo(trailPoints[i].x, trailPoints[i].y);
+            ctx.strokeStyle = 'rgba(255,51,51,' + alpha + ')';
+            ctx.lineWidth = width;
+            ctx.lineCap = 'round';
+            ctx.stroke();
+        }
+    }, 50);
+    
+    // Expose update function
+    window.__tubecli_moveCursor = function(x, y) {
+        cursor.style.display = 'block';
+        cursor.style.left = x + 'px';
+        cursor.style.top = y + 'px';
+        trailPoints.push({ x, y, t: Date.now() });
+        if (trailPoints.length > 500) trailPoints = trailPoints.slice(-300);
+    };
+    
+    window.__tubecli_hideCursor = function() {
+        cursor.style.display = 'none';
+        trailPoints = [];
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+    };
+})();
+`;
+
+async function injectCursorOverlay(page) {
+    try {
+        await page.evaluate(CURSOR_INJECT_JS);
+    } catch (e) { /* page might not be ready */ }
+}
+
+async function updateCursorPos(page, x, y) {
+    try {
+        await page.evaluate(({x, y}) => {
+            if (window.__tubecli_moveCursor) window.__tubecli_moveCursor(x, y);
+        }, {x, y});
+    } catch (e) { /* ignore */ }
+}
+
 async function humanMove(page, targetX, targetY) {
     const startX = lastMouseX || randBetween(100, 600);
     const startY = lastMouseY || randBetween(100, 400);
     const steps = 25 + Math.floor(Math.random() * 25);
+
+    // Inject cursor overlay if not present
+    await injectCursorOverlay(page);
 
     // Random Bezier control points for curved path
     const ctrl1 = {
@@ -72,6 +158,7 @@ async function humanMove(page, targetX, targetY) {
             eased
         );
         await page.mouse.move(pos.x, pos.y);
+        await updateCursorPos(page, pos.x, pos.y);
         // Varying speed — occasional micro-pauses
         if (Math.random() > 0.85) await sleep(randBetween(5, 20));
     }
@@ -114,6 +201,126 @@ async function humanPause(page) {
     }
 }
 
+// ── Page State Checker (detect CAPTCHA, errors, unexpected states) ──
+class PageBlockedError extends Error {
+    constructor(reason, details) {
+        super(`🚫 PAGE BLOCKED: ${reason}`);
+        this.reason = reason;
+        this.details = details;
+        this.isPageBlocked = true;
+    }
+}
+
+async function checkPageState(page, stepIndex, stepType) {
+    try {
+        const stateInfo = await page.evaluate(() => {
+            const url = window.location.href;
+            const title = document.title || '';
+            const bodyText = (document.body?.innerText || '').slice(0, 3000).toLowerCase();
+            const html = (document.documentElement?.innerHTML || '').slice(0, 5000).toLowerCase();
+            
+            // ── CAPTCHA Detection ──
+            const captchaSignals = [
+                // Google reCAPTCHA
+                !!document.querySelector('iframe[src*="recaptcha"]'),
+                !!document.querySelector('.g-recaptcha'),
+                !!document.querySelector('#recaptcha'),
+                // hCaptcha  
+                !!document.querySelector('iframe[src*="hcaptcha"]'),
+                !!document.querySelector('.h-captcha'),
+                // Cloudflare Turnstile
+                !!document.querySelector('iframe[src*="challenges.cloudflare.com"]'),
+                !!document.querySelector('.cf-turnstile'),
+                // Generic
+                bodyText.includes("i'm not a robot") || bodyText.includes('not a robot'),
+                bodyText.includes('verify you are human') || bodyText.includes('xác minh bạn là người'),
+                bodyText.includes('captcha') && !bodyText.includes('captcha_solved'),
+                bodyText.includes('unusual traffic') || bodyText.includes('lưu lượng truy cập bất thường'),
+                bodyText.includes('automated queries') || bodyText.includes('truy vấn tự động'),
+                title.toLowerCase().includes('captcha'),
+            ];
+            const hasCaptcha = captchaSignals.filter(Boolean).length >= 1;
+            
+            // ── Bot/Block Detection ──
+            const blockSignals = [
+                url.includes('/sorry/') && url.includes('google'),  // Google block page
+                url.includes('challenge') && url.includes('blocked'),
+                bodyText.includes('access denied') || bodyText.includes('truy cập bị từ chối'),
+                bodyText.includes('forbidden') && bodyText.includes('403'),
+                bodyText.includes('your ip has been') || bodyText.includes('ip của bạn'),
+                bodyText.includes('rate limit') || bodyText.includes('too many requests'),
+                bodyText.includes('temporarily blocked') || bodyText.includes('tạm thời bị chặn'),
+                bodyText.includes('suspicious activity') || bodyText.includes('hoạt động đáng ngờ'),
+            ];
+            const isBlocked = blockSignals.filter(Boolean).length >= 1;
+            
+            // ── Error Page Detection ──
+            const errorSignals = [
+                title.includes('404') || bodyText.includes('page not found') || bodyText.includes('không tìm thấy'),
+                title.includes('500') || bodyText.includes('internal server error') || bodyText.includes('lỗi máy chủ'),
+                title.includes('502') || title.includes('503') || title.includes('504'),
+                bodyText.includes('this site can\'t be reached') || bodyText.includes('không thể truy cập'),
+                bodyText.includes('err_connection') || bodyText.includes('dns_probe'),
+                url.startsWith('chrome-error://'),
+            ];
+            const hasError = errorSignals.filter(Boolean).length >= 1;
+            
+            // ── Login Wall Detection ──
+            const loginWall = [
+                bodyText.includes('please sign in') || bodyText.includes('vui lòng đăng nhập'),
+                bodyText.includes('log in to continue') || bodyText.includes('đăng nhập để tiếp tục'),
+                bodyText.includes('session expired') || bodyText.includes('phiên đã hết hạn'),
+            ];
+            const needsLogin = loginWall.filter(Boolean).length >= 1;
+            
+            return {
+                url,
+                title,
+                hasCaptcha,
+                isBlocked,
+                hasError,
+                needsLogin,
+                captchaCount: captchaSignals.filter(Boolean).length,
+                blockCount: blockSignals.filter(Boolean).length,
+                errorCount: errorSignals.filter(Boolean).length,
+            };
+        });
+        
+        // ── React to detected states ──
+        if (stateInfo.hasCaptcha) {
+            stepLog(stepIndex, stepType, `🚫 CAPTCHA DETECTED on ${stateInfo.url}`);
+            stepLog(stepIndex, stepType, `🚫 Page title: "${stateInfo.title}"`);
+            stepLog(stepIndex, stepType, `🚫 Script stopped — manual CAPTCHA solving required`);
+            throw new PageBlockedError('CAPTCHA detected', stateInfo);
+        }
+        
+        if (stateInfo.isBlocked) {
+            stepLog(stepIndex, stepType, `🚫 BLOCKED/BANNED on ${stateInfo.url}`);
+            stepLog(stepIndex, stepType, `🚫 Page title: "${stateInfo.title}"`);
+            stepLog(stepIndex, stepType, `🚫 Script stopped — IP or account may be blocked`);
+            throw new PageBlockedError('Access blocked/banned', stateInfo);
+        }
+        
+        if (stateInfo.hasError) {
+            stepLog(stepIndex, stepType, `🚫 ERROR PAGE on ${stateInfo.url}`);
+            stepLog(stepIndex, stepType, `🚫 Page title: "${stateInfo.title}"`);
+            stepLog(stepIndex, stepType, `🚫 Script stopped — page returned an error`);
+            throw new PageBlockedError('Error page detected', stateInfo);
+        }
+        
+        if (stateInfo.needsLogin) {
+            stepLog(stepIndex, stepType, `⚠️ LOGIN REQUIRED on ${stateInfo.url}`);
+            stepLog(stepIndex, stepType, `⚠️ Page title: "${stateInfo.title}"`);
+            // Don't throw for login — might be expected (e.g. Gmail login script)
+            // Just warn
+        }
+        
+    } catch (err) {
+        if (err.isPageBlocked) throw err; // Re-throw our custom errors
+        // Ignore evaluate errors (page might be navigating)
+    }
+}
+
 async function executeStep(page, step, index) {
     const type = step.type;
     const params = step.params || {};
@@ -133,7 +340,10 @@ async function executeStep(page, step, index) {
                 url = 'https://' + url;
             }
             await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+            await injectCursorOverlay(page); // Re-inject cursor after navigation
             stepLog(index, type, `Navigated to ${url}`);
+            // ── Page State Check after navigation ──
+            await checkPageState(page, index, type);
             break;
         }
         case 'click': {
@@ -151,6 +361,9 @@ async function executeStep(page, step, index) {
             if (params.force) await el.click({ force: true });
             else await el.click();
             stepLog(index, type, `Clicked: ${selector}`);
+            // ── Page State Check after click (wait for potential navigation) ──
+            await sleep(1500); // Give page time to start navigating
+            await checkPageState(page, index, type);
             break;
         }
         case 'type': {
@@ -186,6 +399,41 @@ async function executeStep(page, step, index) {
             const result = await page.evaluate(code);
             if (params.save_as) variables[params.save_as] = result;
             stepLog(index, type, `Evaluated, result: ${JSON.stringify(result).slice(0, 200)}`);
+            break;
+        }
+        case 'fetch_otp': {
+            // Fetch TOTP code from TubeCLI 2FA API (server-side, not browser)
+            const secret = interpolate(params.secret || '');
+            if (!secret) {
+                stepLog(index, type, '⚠️ No TOTP secret provided — skipping 2FA');
+                break;
+            }
+            const tubecliPort = process.env.TUBECLI_PORT || '5295';
+            const otpUrl = `http://localhost:${tubecliPort}/api/v1/browser/2fa?secret=${encodeURIComponent(secret.replace(/\s+/g, '').toUpperCase())}`;
+            stepLog(index, type, `🔐 Fetching OTP from API...`);
+            try {
+                const http = require('http');
+                const otpData = await new Promise((resolve, reject) => {
+                    const req = http.get(otpUrl, (res) => {
+                        let body = '';
+                        res.on('data', chunk => body += chunk);
+                        res.on('end', () => {
+                            try { resolve(JSON.parse(body)); } catch(e) { reject(e); }
+                        });
+                    });
+                    req.on('error', reject);
+                    req.setTimeout(10000, () => { req.destroy(); reject(new Error('timeout')); });
+                });
+                if (otpData && otpData.code) {
+                    const saveName = params.save_as || 'otp_code';
+                    variables[saveName] = String(otpData.code);
+                    stepLog(index, type, `🔐 OTP: ${otpData.code} (valid ~${otpData.remaining}s) → {{${saveName}}}`);
+                } else {
+                    stepLog(index, type, `⚠️ API returned no code: ${JSON.stringify(otpData)}`);
+                }
+            } catch (err) {
+                stepLog(index, type, `🚫 Failed to fetch OTP: ${err.message}`);
+            }
             break;
         }
         case 'extract': {
@@ -363,6 +611,12 @@ async function executeStepWithRetry(page, step, index) {
             await executeStep(page, step, index);
             return;
         } catch (err) {
+            // ── Page blocked errors bypass all retries — stop immediately ──
+            if (err.isPageBlocked) {
+                stepLog(index, step.type, `🚫 ${err.message}`);
+                throw err; // Propagate up to stop script
+            }
+            
             const msg = `Step ${index} failed (attempt ${attempt + 1}/${retryCount + 1}): ${err.message}`;
             stepLog(index, step.type, msg);
             if (attempt < retryCount) {
@@ -374,6 +628,120 @@ async function executeStepWithRetry(page, step, index) {
             const isSelectorError = err.message.includes('Timeout') ||
                                     err.message.includes('waiting for') ||
                                     err.message.includes('locator');
+
+            // ── Phase 0: Auto 2FA Handler ──
+            // If step failed and page is on a 2FA challenge, handle it automatically
+            try {
+                const currentUrl = page.url() || '';
+                const is2FAPage = await page.evaluate(() => {
+                    const body = (document.body?.innerText || '').toLowerCase();
+                    const selectors = [
+                        'input#totpPin', 'input[name="totpPin"]', 'input[type="tel"]',
+                        'input[autocomplete="one-time-code"]', 'input[name="approvals_code"]',
+                        'input[placeholder*="code" i]', 'input[aria-label*="code" i]',
+                    ];
+                    const hasInput = selectors.some(s => !!document.querySelector(s));
+                    const hasText = body.includes('2-step') || body.includes('two-step') ||
+                                    body.includes('verification') || body.includes('xác minh') ||
+                                    body.includes('authenticator') || body.includes('2fa') ||
+                                    body.includes('mã xác minh');
+                    return hasInput || hasText;
+                }).catch(() => false);
+
+                if (is2FAPage && variables.totp_secret) {
+                    stepLog(index, step.type, '🔐 2FA challenge detected! Auto-handling...');
+                    
+                    // Fetch OTP from API
+                    const secret = variables.totp_secret.replace(/\s+/g, '').toUpperCase();
+                    const tubecliPort = process.env.TUBECLI_PORT || '5295';
+                    const otpUrl = `http://localhost:${tubecliPort}/api/v1/browser/2fa?secret=${encodeURIComponent(secret)}`;
+                    
+                    const http = require('http');
+                    const otpData = await new Promise((resolve, reject) => {
+                        const req = http.get(otpUrl, (res) => {
+                            let body = '';
+                            res.on('data', chunk => body += chunk);
+                            res.on('end', () => {
+                                try { resolve(JSON.parse(body)); } catch(e) { reject(e); }
+                            });
+                        });
+                        req.on('error', reject);
+                        req.setTimeout(10000, () => { req.destroy(); reject(new Error('timeout')); });
+                    });
+
+                    if (otpData && otpData.code) {
+                        stepLog(index, step.type, `🔐 Got OTP: ${otpData.code} (valid ~${otpData.remaining}s)`);
+                        
+                        // Find and fill 2FA input
+                        const otpSelectors = [
+                            'input#totpPin', 'input[name="totpPin"]', 'input[type="tel"]',
+                            'input[autocomplete="one-time-code"]', 'input[name="approvals_code"]',
+                            'input[placeholder*="code" i]', 'input[aria-label*="code" i]',
+                        ];
+                        for (const sel of otpSelectors) {
+                            const otpInput = page.locator(sel).first();
+                            if (await otpInput.isVisible({ timeout: 1000 }).catch(() => false)) {
+                                // Move cursor to input
+                                const box = await otpInput.boundingBox();
+                                if (box) await humanMove(page, box.x + box.width / 2, box.y + box.height / 2);
+                                await sleep(randBetween(200, 500));
+                                await otpInput.click();
+                                await otpInput.fill('');
+                                // Type code like a human
+                                for (const char of otpData.code) {
+                                    await page.keyboard.type(char, { delay: 80 + Math.random() * 120 });
+                                }
+                                stepLog(index, step.type, `🔐 Entered OTP into ${sel}`);
+                                break;
+                            }
+                        }
+                        
+                        await sleep(randBetween(500, 1000));
+                        
+                        // Click submit/next button
+                        const submitSelectors = [
+                            '#totpNext button', 'button[jsname="LgbsSe"]',
+                            'button:has-text("Next")', 'button:has-text("Tiếp theo")',
+                            'button:has-text("Verify")', 'button:has-text("Xác minh")',
+                            'button:has-text("Submit")', 'button[type="submit"]',
+                        ];
+                        for (const sel of submitSelectors) {
+                            const btn = page.locator(sel).first();
+                            if (await btn.isVisible({ timeout: 1000 }).catch(() => false)) {
+                                const box = await btn.boundingBox();
+                                if (box) await humanMove(page, box.x + box.width / 2, box.y + box.height / 2);
+                                await sleep(randBetween(300, 600));
+                                await btn.click();
+                                stepLog(index, step.type, `🔐 Clicked ${sel}`);
+                                break;
+                            }
+                        }
+                        
+                        // Wait for 2FA to clear
+                        stepLog(index, step.type, '🔐 Waiting for 2FA to clear...');
+                        await sleep(5000);
+                        await injectCursorOverlay(page);
+                        
+                        // Retry original step
+                        stepLog(index, step.type, '🔐 2FA handled! Retrying original step...');
+                        try {
+                            await executeStep(page, step, index);
+                            return; // Success!
+                        } catch (retryErr) {
+                            stepLog(index, step.type, `Step still failed after 2FA: ${retryErr.message}`);
+                        }
+                    } else {
+                        stepLog(index, step.type, '⚠️ 2FA detected but API returned no code');
+                    }
+                } else if (is2FAPage && !variables.totp_secret) {
+                    stepLog(index, step.type, '⚠️ 2FA challenge detected but no totp_secret variable set!');
+                    stepLog(index, step.type, '⚠️ Add a variable "totp_secret" with your TOTP base32 secret key');
+                }
+            } catch (twoFaErr) {
+                // 2FA handler failed — continue to Smart Fix
+                if (twoFaErr.message) stepLog(index, step.type, `2FA auto-handler error: ${twoFaErr.message}`);
+            }
+
             if (isSelectorError && (step.selector || step.type === 'wait' || step.type === 'navigate')) {
 
                 // ─── Phase 1: Smart Selector Finder (no AI, instant) ───
@@ -383,91 +751,250 @@ async function executeStepWithRetry(page, step, index) {
 
                 // Extract keywords from failed selector for matching
                 const selectorKeywords = origSelector.toLowerCase()
-                    .replace(/[#.\[\]='"]/g, ' ').split(/\s+/)
-                    .filter(w => w.length > 2 && !['first', 'last', 'nth'].includes(w));
+                    .replace(/[#.\[\]='":()]/g, ' ').split(/\s+/)
+                    .filter(w => w.length > 2 && !['first', 'last', 'nth', 'child', 'type', 'not', 'has', 'text', 'button', 'div', 'span', 'input'].includes(w));
                 const labelHint = (step.label || '').toLowerCase();
-                const isSearching = labelHint.includes('search') || selectorKeywords.includes('search');
-                const isInput = origSelector.includes('input') || origSelector.includes('text') || isSearching;
+                const labelWords = labelHint.split(/\s+/).filter(w => w.length > 2);
+                
+                // ── Intent detection from label ──
+                const isButton = labelHint.includes('click') || labelHint.includes('button') || labelHint.includes('submit') || 
+                                 labelHint.includes('next') || labelHint.includes('tiếp') || labelHint.includes('đăng') ||
+                                 labelHint.includes('gửi') || labelHint.includes('sign') || labelHint.includes('log') ||
+                                 step.type === 'click';
+                const isInput = labelHint.includes('type') || labelHint.includes('enter') || labelHint.includes('input') ||
+                                labelHint.includes('nhập') || labelHint.includes('email') || labelHint.includes('password') ||
+                                labelHint.includes('search') || labelHint.includes('tìm') ||
+                                origSelector.includes('input') || origSelector.includes('textarea') ||
+                                step.type === 'type';
+                const isLink = labelHint.includes('link') || labelHint.includes('href') || origSelector.includes('a[');
+                const isSearching = labelHint.includes('search') || selectorKeywords.includes('search') || labelHint.includes('tìm');
 
-                // ── Strategy 1: Playwright Native Locators (pierce Shadow DOM) ──
+                // ── Extract text hints from label (multi-language) ──
+                // "Click Next after email" → look for button with text "Next"
+                // "Hover over Next button" → look for "Next"
+                const actionWords = ['click', 'hover', 'wait', 'press', 'tap', 'select', 'check', 'find', 'for', 'on', 'the', 'over',
+                                     'after', 'before', 'bấm', 'nhấn', 'chọn', 'đợi', 'tìm', 'vào', 'nút', 'button', 'link', 'input', 'box'];
+                const textHints = labelWords.filter(w => !actionWords.includes(w) && w.length > 1);
+                
+                stepLog(index, step.type, `🔍 Intent: ${isButton ? 'button' : isInput ? 'input' : isLink ? 'link' : 'element'}, hints: [${textHints.join(', ')}]`);
+
+                // ══════════════════════════════════════════════
+                // Strategy 0: Well-known site patterns (instant)
+                // ══════════════════════════════════════════════
+                const wellKnownTrials = [];
+                const pageUrl = page.url() || '';
+                
+                if (pageUrl.includes('accounts.google.com') || pageUrl.includes('google.com/signin')) {
+                    // Google Login — language-agnostic selectors
+                    if (labelHint.includes('next') || labelHint.includes('tiếp') || labelHint.includes('identifier')) {
+                        wellKnownTrials.push({ loc: page.locator('#identifierNext button').first(), desc: '#identifierNext button' });
+                        wellKnownTrials.push({ loc: page.locator('#passwordNext button').first(), desc: '#passwordNext button' });
+                        wellKnownTrials.push({ loc: page.locator('button[jsname="LgbsSe"]').first(), desc: 'button[jsname="LgbsSe"]' });
+                    }
+                    if (labelHint.includes('email') || labelHint.includes('identifier')) {
+                        wellKnownTrials.push({ loc: page.locator('input[type="email"]').first(), desc: 'input[type="email"]' });
+                        wellKnownTrials.push({ loc: page.locator('#identifierId').first(), desc: '#identifierId' });
+                    }
+                    if (labelHint.includes('password') || labelHint.includes('mật khẩu')) {
+                        wellKnownTrials.push({ loc: page.locator('input[type="password"]').first(), desc: 'input[type="password"]' });
+                        wellKnownTrials.push({ loc: page.locator('input[name="Passwd"]').first(), desc: 'input[name="Passwd"]' });
+                    }
+                }
+                if (pageUrl.includes('youtube.com')) {
+                    if (isSearching) {
+                        wellKnownTrials.push({ loc: page.locator('input#search').first(), desc: 'input#search' });
+                        wellKnownTrials.push({ loc: page.locator('input[name="search_query"]').first(), desc: 'input[name="search_query"]' });
+                    }
+                    if (labelHint.includes('comment') || labelHint.includes('bình luận')) {
+                        wellKnownTrials.push({ loc: page.locator('#simplebox-placeholder, #contenteditable-root').first(), desc: '#simplebox-placeholder' });
+                        wellKnownTrials.push({ loc: page.locator('div[contenteditable="true"]').first(), desc: 'div[contenteditable]' });
+                    }
+                    if (labelHint.includes('submit') || labelHint.includes('gửi')) {
+                        wellKnownTrials.push({ loc: page.locator('#submit-button button, tp-yt-paper-button#button[aria-label*="Comment"]').first(), desc: '#submit-button' });
+                    }
+                }
+                if (pageUrl.includes('facebook.com')) {
+                    if (labelHint.includes('email') || labelHint.includes('login')) {
+                        wellKnownTrials.push({ loc: page.locator('#email').first(), desc: '#email' });
+                    }
+                    if (labelHint.includes('password')) {
+                        wellKnownTrials.push({ loc: page.locator('#pass').first(), desc: '#pass' });
+                    }
+                    if (labelHint.includes('login') || labelHint.includes('đăng nhập')) {
+                        wellKnownTrials.push({ loc: page.locator('button[name="login"], input[value="Log In"]').first(), desc: 'button[name="login"]' });
+                    }
+                }
+
+                // ══════════════════════════════════════════════
+                // Strategy 1: Playwright Native Locators
+                // ══════════════════════════════════════════════
                 const nativeTrials = [];
 
-                // By placeholder
-                for (const kw of ['Search', 'search', 'Tìm kiếm', ...selectorKeywords]) {
-                    nativeTrials.push({ locator: page.getByPlaceholder(kw, { exact: false }).first(), desc: `getByPlaceholder("${kw}")` });
+                // Button/Link: match by visible text from label hints
+                if (isButton || isLink) {
+                    for (const hint of textHints) {
+                        // Multi-language: try both original and common translations
+                        const textVariants = [hint];
+                        const translations = {
+                            'next': ['Tiếp theo', 'Tiếp tục', 'Continue', 'Next'],
+                            'sign': ['Đăng nhập', 'Đăng ký', 'Sign in', 'Sign up', 'Login'],
+                            'login': ['Đăng nhập', 'Log in', 'Sign in'],
+                            'submit': ['Gửi', 'Submit', 'Đăng', 'Post'],
+                            'search': ['Tìm kiếm', 'Search'],
+                            'cancel': ['Hủy', 'Cancel'],
+                            'ok': ['OK', 'Đồng ý', 'Agree'],
+                            'accept': ['Chấp nhận', 'Accept', 'Đồng ý'],
+                            'close': ['Đóng', 'Close'],
+                            'save': ['Lưu', 'Save'],
+                            'delete': ['Xóa', 'Delete', 'Remove'],
+                            'comment': ['Bình luận', 'Comment'],
+                            'reply': ['Trả lời', 'Reply'],
+                            'send': ['Gửi', 'Send'],
+                        };
+                        for (const [key, vals] of Object.entries(translations)) {
+                            if (hint.includes(key) || key.includes(hint)) {
+                                textVariants.push(...vals);
+                            }
+                        }
+                        
+                        for (const txt of [...new Set(textVariants)]) {
+                            nativeTrials.push({ locator: page.getByRole('button', { name: txt, exact: false }).first(), desc: `getByRole("button", "${txt}")` });
+                            nativeTrials.push({ locator: page.getByRole('link', { name: txt, exact: false }).first(), desc: `getByRole("link", "${txt}")` });
+                            nativeTrials.push({ locator: page.getByText(txt, { exact: false }).first(), desc: `getByText("${txt}")` });
+                        }
+                    }
+                    // Generic button roles
+                    nativeTrials.push({ locator: page.locator('[type="submit"]').first(), desc: '[type="submit"]' });
                 }
-                // By role
+
+                // Input: match by role, placeholder, label
                 if (isInput) {
+                    for (const hint of textHints) {
+                        nativeTrials.push({ locator: page.getByPlaceholder(hint, { exact: false }).first(), desc: `getByPlaceholder("${hint}")` });
+                        nativeTrials.push({ locator: page.getByLabel(hint, { exact: false }).first(), desc: `getByLabel("${hint}")` });
+                    }
+                    nativeTrials.push({ locator: page.getByRole('textbox').first(), desc: 'getByRole("textbox")' });
                     nativeTrials.push({ locator: page.getByRole('searchbox').first(), desc: 'getByRole("searchbox")' });
                     nativeTrials.push({ locator: page.getByRole('combobox').first(), desc: 'getByRole("combobox")' });
-                    nativeTrials.push({ locator: page.getByRole('textbox').first(), desc: 'getByRole("textbox")' });
+                    
+                    // Common input types based on label
+                    if (labelHint.includes('email')) {
+                        nativeTrials.push({ locator: page.locator('input[type="email"]').first(), desc: 'input[type="email"]' });
+                    }
+                    if (labelHint.includes('password') || labelHint.includes('mật khẩu')) {
+                        nativeTrials.push({ locator: page.locator('input[type="password"]').first(), desc: 'input[type="password"]' });
+                    }
                 }
-                // By label
+
+                // Fallback: generic keyword matching via label/placeholder/aria
                 for (const kw of selectorKeywords) {
                     nativeTrials.push({ locator: page.getByLabel(kw, { exact: false }).first(), desc: `getByLabel("${kw}")` });
                 }
 
-                // ── Strategy 2: XPath (deep DOM traversal) ──
+                // ══════════════════════════════════════════════
+                // Strategy 2: XPath (deep DOM traversal)
+                // ══════════════════════════════════════════════
                 const xpathTrials = [];
-                if (isInput) {
-                    xpathTrials.push(`//input[contains(@name,'search')]`);
-                    xpathTrials.push(`//input[contains(@placeholder,'Search') or contains(@placeholder,'search')]`);
-                    xpathTrials.push(`//input[contains(@class,'search') or contains(@class,'Search')]`);
-                    xpathTrials.push(`//input[@type='text' or @type='search']`);
-                    xpathTrials.push(`//*[@role='combobox' and (contains(@placeholder,'Search') or contains(@name,'search'))]`);
-                    xpathTrials.push(`//*[@role='searchbox']`);
+                
+                // Button XPaths
+                if (isButton) {
+                    for (const hint of textHints) {
+                        xpathTrials.push(`//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'),'${hint}')]`);
+                        xpathTrials.push(`//*[@role='button'][contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'),'${hint}')]`);
+                        xpathTrials.push(`//a[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'),'${hint}')]`);
+                        xpathTrials.push(`//*[contains(@aria-label,'${hint}') or contains(@title,'${hint}')]`);
+                    }
+                    // Generic submit/next buttons
+                    xpathTrials.push(`//button[@type='submit']`);
+                    xpathTrials.push(`//input[@type='submit']`);
+                    xpathTrials.push(`//*[@role='button' and (@jsname or @data-action)]`);
                 }
-                // Generic: match by label text
+                
+                // Input XPaths
+                if (isInput) {
+                    for (const hint of textHints) {
+                        xpathTrials.push(`//input[contains(@name,'${hint}') or contains(@id,'${hint}') or contains(@placeholder,'${hint}') or contains(@aria-label,'${hint}')]`);
+                        xpathTrials.push(`//textarea[contains(@name,'${hint}') or contains(@id,'${hint}') or contains(@placeholder,'${hint}')]`);
+                        xpathTrials.push(`//*[@contenteditable='true'][contains(@aria-label,'${hint}')]`);
+                    }
+                    if (isSearching) {
+                        xpathTrials.push(`//input[contains(@name,'search') or contains(@name,'query') or @type='search']`);
+                        xpathTrials.push(`//input[contains(@placeholder,'Search') or contains(@placeholder,'search') or contains(@placeholder,'Tìm')]`);
+                    }
+                }
+                
+                // Generic: any element matching keywords by id/name/aria
                 for (const kw of selectorKeywords) {
-                    xpathTrials.push(`//*[contains(@name,'${kw}') or contains(@id,'${kw}') or contains(@placeholder,'${kw}')]`);
+                    xpathTrials.push(`//*[contains(@id,'${kw}') or contains(@name,'${kw}') or contains(@aria-label,'${kw}') or contains(@data-testid,'${kw}')]`);
                 }
 
-                // ── Strategy 3: CSS alternatives ──
+                // ══════════════════════════════════════════════
+                // Strategy 3: CSS alternatives
+                // ══════════════════════════════════════════════
                 const cssTrials = [];
+                
+                if (isButton) {
+                    for (const kw of selectorKeywords) {
+                        cssTrials.push(`button[aria-label*="${kw}"], button[title*="${kw}"]`);
+                        cssTrials.push(`[role="button"][aria-label*="${kw}"]`);
+                        cssTrials.push(`button[data-testid*="${kw}"]`);
+                        cssTrials.push(`a[aria-label*="${kw}"]`);
+                    }
+                }
                 if (isInput) {
-                    cssTrials.push(`input[name*="search"]`);
-                    cssTrials.push(`input[name*="query"]`);
-                    cssTrials.push(`input[placeholder*="Search"]`);
+                    for (const kw of selectorKeywords) {
+                        cssTrials.push(`input[name*="${kw}"], input[id*="${kw}"]`);
+                        cssTrials.push(`input[placeholder*="${kw}"]`);
+                        cssTrials.push(`textarea[name*="${kw}"]`);
+                        cssTrials.push(`[contenteditable="true"][aria-label*="${kw}"]`);
+                    }
                     cssTrials.push(`input[type="search"]`);
-                    cssTrials.push(`[role="combobox"]`);
-                    cssTrials.push(`[role="searchbox"]`);
                 }
                 for (const kw of selectorKeywords) {
-                    cssTrials.push(`[name*="${kw}"]`);
+                    cssTrials.push(`[data-testid*="${kw}"]`);
                     cssTrials.push(`[aria-label*="${kw}"]`);
                     cssTrials.push(`#${kw}`);
                 }
 
-                // ── Try all strategies ──
-                // 1. Playwright native (best for Shadow DOM)
-                for (const trial of nativeTrials) {
-                    try {
-                        const visible = await trial.locator.isVisible({ timeout: 2000 });
-                        if (!visible) continue;
-                        stepLog(index, step.type, `🔍 Found: ${trial.desc}`);
-                        // Execute the step using this locator directly
-                        const tempStep = { ...step };
-                        // We need to get a CSS-like selector from the locator
-                        // Click/type using the locator directly
-                        if (step.type === 'wait') {
-                            await trial.locator.waitFor({ state: 'visible', timeout: 5000 });
-                        } else if (step.type === 'click') {
-                            const box = await trial.locator.boundingBox();
-                            if (box) await humanMove(page, box.x + box.width * randBetween(0.3, 0.7), box.y + box.height * randBetween(0.3, 0.7));
-                            await sleep(randBetween(100, 300));
-                            await trial.locator.click();
-                        } else if (step.type === 'type') {
-                            const box = await trial.locator.boundingBox();
-                            if (box) await humanMove(page, box.x + box.width / 2, box.y + box.height / 2);
-                            await sleep(randBetween(100, 250));
-                            await trial.locator.click();
-                            if (step.params?.clear_first) await trial.locator.fill('');
-                            await humanType(page, interpolate(step.params?.text || ''));
-                        }
-                        stepLog(index, step.type, `✅ Smart fix worked! ${trial.desc}`);
-                        smartFixed = true;
-                        break;
-                    } catch (e) { /* next */ }
+                // ══════════════════════════════════════════════
+                // Execute strategies in priority order
+                // ══════════════════════════════════════════════
+                
+                // Helper: try a locator for click/type/wait
+                const tryLocator = async (loc, desc) => {
+                    const visible = await loc.isVisible({ timeout: 2000 });
+                    if (!visible) return false;
+                    stepLog(index, step.type, `🔍 Found: ${desc}`);
+                    if (step.type === 'wait' || step.type === 'hover') {
+                        if (step.type === 'hover') await loc.hover();
+                        else await loc.waitFor({ state: 'visible', timeout: 5000 });
+                    } else if (step.type === 'click') {
+                        const box = await loc.boundingBox();
+                        if (box) await humanMove(page, box.x + box.width * randBetween(0.3, 0.7), box.y + box.height * randBetween(0.3, 0.7));
+                        await sleep(randBetween(100, 300));
+                        await loc.click();
+                    } else if (step.type === 'type') {
+                        const box = await loc.boundingBox();
+                        if (box) await humanMove(page, box.x + box.width / 2, box.y + box.height / 2);
+                        await sleep(randBetween(100, 250));
+                        await loc.click();
+                        if (step.params?.clear_first) await loc.fill('');
+                        await humanType(page, interpolate(step.params?.text || ''));
+                    }
+                    stepLog(index, step.type, `✅ Smart fix worked! ${desc}`);
+                    return true;
+                };
+
+                // 0. Well-known site patterns (highest priority)
+                for (const wk of wellKnownTrials) {
+                    try { if (await tryLocator(wk.loc, wk.desc)) { smartFixed = true; break; } } catch (e) {}
+                }
+
+                // 1. Playwright native locators
+                if (!smartFixed) {
+                    for (const trial of nativeTrials) {
+                        try { if (await tryLocator(trial.locator, trial.desc)) { smartFixed = true; break; } } catch (e) {}
+                    }
                 }
 
                 // 2. XPath
@@ -475,15 +1002,8 @@ async function executeStepWithRetry(page, step, index) {
                     for (const xpath of xpathTrials) {
                         try {
                             const loc = page.locator(xpath).first();
-                            const visible = await loc.isVisible({ timeout: 1500 });
-                            if (!visible) continue;
-                            stepLog(index, step.type, `🔍 XPath found: ${xpath}`);
-                            step.selector = `xpath=${xpath}`;
-                            await executeStep(page, step, index);
-                            stepLog(index, step.type, `✅ XPath fix worked! ${xpath}`);
-                            smartFixed = true;
-                            break;
-                        } catch (e) { /* next */ }
+                            if (await tryLocator(loc, `xpath: ${xpath}`)) { smartFixed = true; break; }
+                        } catch (e) {}
                     }
                 }
 
@@ -492,15 +1012,8 @@ async function executeStepWithRetry(page, step, index) {
                     for (const css of cssTrials) {
                         try {
                             const loc = page.locator(css).first();
-                            const visible = await loc.isVisible({ timeout: 1500 });
-                            if (!visible) continue;
-                            stepLog(index, step.type, `🔍 CSS found: ${css}`);
-                            step.selector = css;
-                            await executeStep(page, step, index);
-                            stepLog(index, step.type, `✅ CSS fix worked! ${css}`);
-                            smartFixed = true;
-                            break;
-                        } catch (e) { /* next */ }
+                            if (await tryLocator(loc, `css: ${css}`)) { smartFixed = true; break; }
+                        } catch (e) {}
                     }
                 }
 
@@ -527,13 +1040,13 @@ async function executeStepWithRetry(page, step, index) {
                         return getFullDOM(document.body).slice(0, 15000);
                     }).catch(() => '');
 
-                    const pageUrl = await page.url();
+                    const pageUrl = page.url() || '';
                     const visibleText = await page.evaluate(() => {
                         return document.body ? document.body.innerText.slice(0, 3000) : '';
                     }).catch(() => '');
 
-                    // Also include smart-found selectors as hints for AI
-                    const smartHints = smartSelectors.map(m => `${m.sel} (${m.info.tag} name=${m.info.name} placeholder=${m.info.placeholder})`).join('\n');
+                    // Smart selector hints removed (handled in Phase 1 now)
+                    const smartHints = '';
 
                     const tubecliPort = process.env.TUBECLI_PORT || '5295';
                     const fixRes = await fetch(`http://localhost:${tubecliPort}/api/v1/scripts/ai-fix`, {
@@ -643,14 +1156,39 @@ async function executeStepWithRetry(page, step, index) {
                         rawProxy = cfg.proxy;
                         log(`  Loaded proxy from config: ${rawProxy}`);
                         
-                        // Normalize proxy (same logic as BrowserManager)
-                        const simpleFormatRegex = /^(socks5|http|https):\/\/([^:@]+):([^:@]+):([^:@]+):(\d+)$/i;
-                        const match = rawProxy.match(simpleFormatRegex);
-                        if (match) {
-                            normalizedProxy = `${match[1].toLowerCase()}://${match[2]}:${match[3]}@${match[4]}:${match[5]}`;
+                        // Normalize proxy — supports multiple formats:
+                        //   protocol://user:pass@host:port  (standard URL)
+                        //   protocol://host:port:user:pass  (simple format A)
+                        //   protocol://user:pass:host:port  (simple format B)
+                        //   host:port:user:pass             (no protocol)
+                        const fourPartRegex = /^(?:(socks5|socks4|http|https):\/\/)?([^:@]+):([^:@]+):([^:@]+):([^:@]+)$/i;
+                        const urlRegex = /^(?:(socks5|socks4|http|https):\/\/)?([^:@]+):([^:@]+)@([^:@]+):(\d+)$/i;
+                        
+                        let urlMatch = rawProxy.match(urlRegex);
+                        if (urlMatch) {
+                            // Already standard format: user:pass@host:port
+                            const proto = (urlMatch[1] || 'http').toLowerCase();
+                            normalizedProxy = `${proto}://${urlMatch[2]}:${urlMatch[3]}@${urlMatch[4]}:${urlMatch[5]}`;
                         } else {
-                            normalizedProxy = rawProxy;
+                            let fourMatch = rawProxy.match(fourPartRegex);
+                            if (fourMatch) {
+                                const proto = (fourMatch[1] || 'http').toLowerCase();
+                                const p1 = fourMatch[2], p2 = fourMatch[3], p3 = fourMatch[4], p4 = fourMatch[5];
+                                // Detect format by checking which part is a port number
+                                if (/^\d+$/.test(p2)) {
+                                    // Format: host:port:user:pass
+                                    normalizedProxy = `${proto}://${p3}:${p4}@${p1}:${p2}`;
+                                } else if (/^\d+$/.test(p4)) {
+                                    // Format: user:pass:host:port
+                                    normalizedProxy = `${proto}://${p1}:${p2}@${p3}:${p4}`;
+                                } else {
+                                    normalizedProxy = rawProxy;
+                                }
+                            } else {
+                                normalizedProxy = rawProxy;
+                            }
                         }
+                        log(`  Normalized proxy: ${normalizedProxy}`);
 
                         // Parse for Playwright format
                         try {
@@ -678,11 +1216,12 @@ async function executeStepWithRetry(page, step, index) {
         }
     }
 
-    // Kill Chrome processes using THIS specific profile (safe: won't touch user's browser)
+    // Kill Chrome AND BAS worker processes using THIS specific profile (safe: won't touch user's browser)
     if (storageDir && fs.existsSync(storageDir)) {
         try {
             const { execSync } = require('child_process');
             const escaped = storageDir.replace(/\\/g, '\\\\\\\\');
+            // Kill chrome.exe using this profile
             const wmicOut = execSync(
                 `wmic process where "name='chrome.exe' and CommandLine like '%${escaped}%'" get ProcessId /format:csv`,
                 { encoding: 'utf-8', timeout: 5000 }
@@ -695,9 +1234,28 @@ async function executeStepWithRetry(page, step, index) {
                 for (const pid of pids) {
                     try { execSync(`taskkill /PID ${pid} /F`, { timeout: 3000 }); } catch (e) {}
                 }
-                await sleep(1500);
             }
         } catch (e) { /* wmic may not be available */ }
+
+        // Kill BAS worker processes (they hold profile locks and prevent re-launch)
+        try {
+            const { execSync } = require('child_process');
+            const workerOut = execSync(
+                `wmic process where "name='worker.exe'" get ProcessId /format:csv`,
+                { encoding: 'utf-8', timeout: 5000 }
+            ).trim();
+            const workerPids = workerOut.split('\n')
+                .map(l => l.trim().split(',').pop())
+                .filter(p => p && /^\d+$/.test(p));
+            if (workerPids.length > 0) {
+                log(`Closing ${workerPids.length} BAS worker process(es)...`);
+                for (const pid of workerPids) {
+                    try { execSync(`taskkill /PID ${pid} /F`, { timeout: 3000 }); } catch (e) {}
+                }
+            }
+        } catch (e) {}
+        
+        if (true) await sleep(1500);
 
         // Also clean lock files
         const lockFiles = ['SingletonLock', 'SingletonSocket', 'SingletonCookie'];
@@ -717,7 +1275,7 @@ async function executeStepWithRetry(page, step, index) {
     let context;
 
     if (engine === 'bablosoft') {
-        log('Launching with Bablosoft engine (fingerprint)...');
+        log('Launching with Security Browser engine (fingerprint)...');
         const originalCwd = process.cwd();
         try {
             const browserExtDir = path.resolve(__dirname, '..', '..', '..', '..', 'tubecli', 'extensions', 'browser');
@@ -823,20 +1381,37 @@ async function executeStepWithRetry(page, step, index) {
 
 
             // ── 5. Launch ──
-            // Use a separate profile dir for Bablosoft to prevent Playwright lock/corruption timeouts
+            // Use a separate profile dir for Security Browser to prevent Playwright lock/corruption timeouts
             const launchPath = (storageDir || path.join(execData.profiles_dir || '', profile)) + '_bas';
             
-            // Clean lock files in BOTH the original and _bas profile directories
-            for (const dir of [storageDir, launchPath]) {
-                for (const lf of ['SingletonLock', 'SingletonSocket', 'SingletonCookie', 'LOCK', 'lockfile']) {
-                    try { fs.unlinkSync(path.join(dir, lf)); } catch (e) {}
-                    try { fs.unlinkSync(path.join(dir, 'Default', lf)); } catch (e) {}
+            // Clean ALL lock files recursively in both profile directories
+            function cleanLocksRecursive(dir) {
+                if (!fs.existsSync(dir)) return;
+                let cleaned = 0;
+                const lockNames = ['SingletonLock', 'SingletonSocket', 'SingletonCookie', 'LOCK', 'lockfile'];
+                function walk(d) {
+                    try {
+                        const entries = fs.readdirSync(d, { withFileTypes: true });
+                        for (const e of entries) {
+                            const full = path.join(d, e.name);
+                            if (e.isDirectory()) {
+                                walk(full);
+                            } else if (lockNames.includes(e.name)) {
+                                try { fs.unlinkSync(full); cleaned++; } catch (err) {}
+                            }
+                        }
+                    } catch (err) {}
                 }
+                walk(dir);
+                if (cleaned > 0) log(`  🔓 Cleaned ${cleaned} lock files in ${path.basename(dir)}`);
+            }
+            for (const dir of [storageDir, launchPath]) {
+                cleanLocksRecursive(dir);
             }
 
             if (normalizedProxy) {
                 plugin.useProxy(normalizedProxy, { changeTimezone: true, changeGeolocation: true });
-                log(`  ✅ Bablosoft proxy applied: ${normalizedProxy}`);
+                log(`  ✅ Security Browser proxy applied: ${normalizedProxy}`);
             } else {
                 plugin.proxy = null;
             }
@@ -846,40 +1421,57 @@ async function executeStepWithRetry(page, step, index) {
                 args: ['--start-maximized', '--disable-blink-features=AutomationControlled'],
                 timeout: 120000
             });
-            log('✅ Bablosoft browser launched with fingerprint.');
+            log('✅ Security Browser launched with fingerprint.');
             process.chdir(originalCwd);
         } catch (basErr) {
             process.chdir(originalCwd);
-            log('Bablosoft failed: ' + String(basErr.message).split('\n')[0] + '. Falling back to Playwright...');
+            log('Security Browser failed: ' + String(basErr.message).split('\n')[0] + '. Falling back to Playwright...');
             try {
                 for (const lf of ['SingletonLock', 'SingletonSocket', 'SingletonCookie', 'LOCK', 'lockfile']) {
                     try { fs.unlinkSync(path.join(storageDir, lf)); } catch (e) {}
                     try { fs.unlinkSync(path.join(storageDir, 'Default', lf)); } catch (e) {}
                 }
                 const ctxOpts = {
-                    headless, args: launchArgs,
+                    headless, args: [...launchArgs],
                     ignoreDefaultArgs: ['--enable-automation'], viewport: { width: 1280, height: 800 }
                 };
-                if (pwProxy) ctxOpts.proxy = pwProxy;
+                // SOCKS5 with auth: Chromium doesn't support it via Playwright proxy option
+                // Use --proxy-server Chrome arg instead
+                if (pwProxy && normalizedProxy && /^socks/i.test(normalizedProxy) && pwProxy.username) {
+                    ctxOpts.args.push(`--proxy-server=${pwProxy.server}`);
+                    log(`  ⚠️ SOCKS5+auth: using Chrome --proxy-server flag (auth may not work)`);
+                } else if (pwProxy) {
+                    ctxOpts.proxy = pwProxy;
+                }
                 context = await chromium.launchPersistentContext(storageDir, ctxOpts);
             } catch (e2) {
-                log('Profile also failed. Using fresh browser + cookies...');
-                const brOpts = { headless, args: launchArgs, ignoreDefaultArgs: ['--enable-automation'] };
-                if (pwProxy) brOpts.proxy = pwProxy;
-                const browser = await chromium.launch(brOpts);
-                context = await browser.newContext({ viewport: { width: 1280, height: 800 } });
-                const cookieFile = path.join(storageDir, 'cookies.json');
-                if (fs.existsSync(cookieFile)) {
-                    try {
-                        const cookies = JSON.parse(fs.readFileSync(cookieFile, 'utf-8'));
-                        const cleaned = cookies.filter(c => c.name && c.domain).map(c => {
-                            const cc = { ...c };
-                            if (!['Strict', 'Lax', 'None'].includes(cc.sameSite)) cc.sameSite = 'Lax';
-                            return cc;
-                        });
-                        await context.addCookies(cleaned);
-                        log('  Injected ' + cleaned.length + ' cookies.');
-                    } catch (ce) {}
+                log('Profile also failed: ' + String(e2.message).split('\n')[0]);
+                log('Using fresh browser + cookies...');
+                try {
+                    const brOpts = { headless, args: [...launchArgs], ignoreDefaultArgs: ['--enable-automation'] };
+                    if (pwProxy && normalizedProxy && /^socks/i.test(normalizedProxy) && pwProxy.username) {
+                        brOpts.args.push(`--proxy-server=${pwProxy.server}`);
+                    } else if (pwProxy) {
+                        brOpts.proxy = pwProxy;
+                    }
+                    const browser = await chromium.launch(brOpts);
+                    context = await browser.newContext({ viewport: { width: 1280, height: 800 } });
+                    const cookieFile = path.join(storageDir, 'cookies.json');
+                    if (fs.existsSync(cookieFile)) {
+                        try {
+                            const cookies = JSON.parse(fs.readFileSync(cookieFile, 'utf-8'));
+                            const cleaned = cookies.filter(c => c.name && c.domain).map(c => {
+                                const cc = { ...c };
+                                if (!['Strict', 'Lax', 'None'].includes(cc.sameSite)) cc.sameSite = 'Lax';
+                                return cc;
+                            });
+                            await context.addCookies(cleaned);
+                            log('  Injected ' + cleaned.length + ' cookies.');
+                        } catch (ce) {}
+                    }
+                } catch (e3) {
+                    log('❌ All launch methods failed: ' + e3.message);
+                    throw e3;
                 }
             }
         }
